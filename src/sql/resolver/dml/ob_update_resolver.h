@@ -52,6 +52,10 @@ private:
   int is_join_table_update(const ObDMLStmt *stmt, bool &is_multi_table);
   int check_view_updatable();
   int try_add_remove_const_expr_for_assignments();
+  int add_ai_invalidation_assignments(common::ObIArray<ObTableAssignment> &table_assigns);
+  int add_ai_column_null_assignment(const TableItem &table_item,
+                                    const share::schema::ObColumnSchemaV2 &ai_column,
+                                    common::ObIArray<ObTableAssignment> &table_assigns);
   bool is_parent_col_self_ref_fk(uint64_t parent_col_id,
                                  const common::ObIArray<share::schema::ObForeignKeyInfo> &fk_infos);
 

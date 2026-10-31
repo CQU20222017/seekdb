@@ -367,3 +367,56 @@ AIDBG7 publish failed(ret=-5024,
 - 判定某个隐藏/生成列是否影响索引时，不能只看 cid 命中，要按**列语义**映射（基表列 → 索引列）；
 - 若继续攻这一处，方向应是「失效时对向量索引做显式 delete delta」而不是让普通 UPDATE 带上索引维护，
   但那会改动 M2 的失效语义，需单独授权与完整回归。
+
+> **后续**：这条最终是**在第 23 条解决的**——不需要"纳入索引"这种过近似：把失效改成解析期
+> 真实赋值 `<ai_col> = NULL` 后，AI 列本身就是"被赋值的基表列"，向量索引自然命中
+> `collect_related_local_index_ids()`，vid 也随之正常推进，`-5024` 不再出现。过近似保持回退状态。
+
+## 23. 运行期对**共享 ObExpr** 置 NULL 会污染 `old_row_` 镜像 → 向量索引 old/new 互换（M5 已解决）
+
+**现象**：`update docs set content = ...` 在事务内把 `emb` 置空后，`select emb` 确实是 NULL，
+但 `old_vector_removed_from_ann = 0`：ANN 仍能召回被更新的那一行。往向量索引 delta 里打日志：
+
+```
+delta row #1: is_old_row_=true,  vec_id=10002, vlen=0    <- old 本该是旧向量(16B)，却被置空
+delta row #2: is_old_row_=false, vec_id=7,     vlen=16   <- new 本该是 NULL，却拿到旧向量
+```
+
+**根因**：M2 的失效实现是在**运行期**做的——`ObDMLService::process_update_row()` 里
+`record_ai_column_tasks_for_update()` 对 `upd_ctdef.new_row_.at(idx)` 调
+`locate_datum_for_write() + set_null() + evaluated_=true`。问题在于：**当本语句没有给这个 AI 列赋值时，
+`old_row_.at(idx)` 与 `new_row_.at(idx)` 是同一个 `ObExpr` 对象**（update 的 old/new 行都指向
+`column_exprs_` 里那一个引用）。`set_null()` 把 `old` 镜像一起置空，于是 delta 拿到的
+old/new 互换了：旧向量被当成"新值 NULL"删掉、又用旧向量当"新值"插回 → ANN 里旧向量还在。
+
+**修法（正解）**：把失效从"运行期改行镜像"改成**解析期物化成真实赋值** `ai_col = NULL`：
+
+- 落点 `ObUpdateResolver::resolve()`，在 `resolve_assignments()` 之后、`generate_update_table_info()` /
+  `resolve_additional_assignments()` 之前调用新增的 `add_ai_invalidation_assignments()`：
+  rowkey 被赋值 → 该表所有 AI 列失效；否则用
+  `build_ai_hidden_column_name(AI_RESULT_SPEC_COLUMN_PREFIX, ...)` 取 spec 隐藏列，`parse_ai_column_spec_text()`
+  拿 `dep_columns_`，任一依赖列在 `assignments_` 里 → 该 AI 列失效；语句已显式写该 AI 列（worker 回写）则跳过；
+- 用 `T_NULL` 常量 + `ObRawExprUtils::build_column_conv_expr()` 造 NULL 值表达式，
+  `ObAssignment{column_expr_, null_expr, is_implicit_=true}` 交给 `add_assignment()`；
+  `is_implicit_` 让 `ObDmlCgService::check_ai_column_not_written()` 跳过（不会误报 1235"禁止写 AI 列"）；
+- 删掉 `ob_dml_service.cpp` 里那三行运行期 `set_null()`（保留 `record_ai_task_delete/upsert` 任务记录逻辑，
+  M2 的 `dependency_update_task` 依赖它）；`ob_del_upd_log_plan.cpp` 的过近似在第 22 条已回退，此处不需要。
+
+**为什么真实赋值能顺带把索引维护带对**（不用再碰 `collect_related_local_index_ids()`）：
+1. `old/new` 变成两个 Expr（old 是列引用、new 是独立的 NULL conv），镜像不再互相污染；
+2. 解析期 `check_update_vector_col_with_vector_index()` 现在能看到"本语句在写带向量索引的列"，
+   `is_vec_hnsw_vid_column()` 分支自动补 vid 列赋值 → **vid 正常推进**，索引 delta 的 old/new vid 各归其位；
+3. `collect_related_local_index_ids()` 的判定是 `index_schema->get_column_schema(base_cid) != nullptr`，
+   AI 列现在作为**真实被赋值的基表列**出现，向量索引/其 delta buffer 自然命中，不再需要过近似。
+
+**结果**：`old_vector_removed_from_ann / regenerated_vector_ready / regenerated_vector_visible_to_ann`
+全部 = 1，且 explain 的 `est.rows` 也从 2 回到基线的 4。
+
+**教训（可复用）**：
+- DML 行里 old/new **共享同一个 `ObExpr`** 是常态（列未被赋值时二者就是 `column_exprs_` 的同一引用）。
+  任何"只改新行"的运行期 hack 都必须先确认 old 是否共享——`locate_datum_for_write()` 改的是表达式的结果 buffer，
+  不区分 old/new；
+- 让引擎自己"看见"这次写（解析期生成真实赋值）比在运行期伪造行镜像更安全：类型推导、列 conv、
+  NOT NULL/CHECK/视图检查、索引维护、回滚全部走原有路径；
+- 顺带得到的判据：如果某处 hack 需要"临时把值改掉但又不想影响 old"，那基本就是设计错位，
+  应该在**解析期**把意图表达进 AST/assignment，而不是在执行期改 datum。

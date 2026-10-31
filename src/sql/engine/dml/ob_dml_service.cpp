@@ -790,11 +790,11 @@ int record_ai_column_tasks_for_update(const ObUpdCtDef &upd_ctdef, ObTableModify
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("the AI column is not part of the update row", KR(ret), K(idx));
     } else {
-      // 1. reset the result column of the row this statement writes
-      ObDatum &datum = ai_expr->locate_datum_for_write(eval_ctx);
-      datum.set_null();
-      ai_expr->get_eval_info(eval_ctx).evaluated_ = true;
-      // 2. schedule the work item of the new row key. A work item of this key may already be
+      // The AI column value of the written row is reset by the `ai_column = NULL` assignment
+      // that the resolver adds to the statement (see
+      // ObUpdateResolver::add_ai_invalidation_assignments()), so the row image must not be
+      // touched here: the new row of this DML row shares its expression with the old row.
+      // Schedule the work item of the new row key. A work item of this key may already be
       // pending (e.g. produced by the INSERT of the row), so the old one is removed first: DAS
       // runs the delete task of a statement before its insert task.
       if (OB_FAIL(dml_op.record_ai_task_delete(table_id,

@@ -627,12 +627,12 @@ class ScriptParser:
             self.pending_errors = codes
             return None
         if name == "replace_regex":
-            pair = parse_replace_regex(argument)
-            if pair is None:
+            pairs = parse_replace_regex(argument)
+            if not pairs:
                 self.result.note(line, "cannot parse --replace_regex %r" % argument[:60])
             else:
                 # applies to the output block of the next statement only
-                self.pending_replace_regexes.append(pair)
+                self.pending_replace_regexes.extend(pairs)
             return None
         if name == "disable_warnings":
             self.warnings_on = False
@@ -966,24 +966,45 @@ class StatementDiff:
 
 
 def parse_replace_regex(argument):
-    """``/pattern/replacement/`` -> (compiled pattern, replacement) or None.
+    """Parse one ``--replace_regex`` line into a list of (pattern, replacement).
 
-    The pattern is cut between the first and the LAST slash so that a slash
-    inside the pattern is kept as is.  ``\1`` style back references are valid
-    in both mysql-test and Python, so the replacement text is used verbatim.
+    mysql-test accepts several space separated ``/pattern/replacement/[g]``
+    pairs on one line, plus an optional ``g`` (or ``i``) flag after the closing
+    slash, so both forms are supported here.  A backslash escapes the next
+    character, which keeps ``\\/`` inside a pattern and ``\\1`` style back
+    references intact: back references are valid in both mysql-test and Python,
+    so the replacement text is used verbatim.
     """
-    text = argument.strip()
-    if len(text) < 2 or not text.startswith("/") or not text.endswith("/"):
-        return None
-    inner = text[1:-1]
-    slash = inner.rfind("/")
-    if slash <= 0:
-        return None
-    pattern, replacement = inner[:slash], inner[slash + 1:]
-    try:
-        return re.compile(pattern), replacement
-    except re.error:
-        return None
+    pairs = []
+    text = argument
+    i = 0
+    while i < len(text):
+        if text[i] != "/":
+            i += 1
+            continue
+        i += 1
+        parts = []
+        value = []
+        while i < len(text) and len(parts) < 2:
+            if text[i] == "\\" and i + 1 < len(text):
+                value.append(text[i:i + 2])
+                i += 2
+            elif text[i] == "/":
+                parts.append("".join(value))
+                value = []
+                i += 1
+            else:
+                value.append(text[i])
+                i += 1
+        while i < len(text) and text[i] in "gi":
+            i += 1
+        if len(parts) < 2:
+            break
+        try:
+            pairs.append((re.compile(parts[0]), parts[1]))
+        except re.error:
+            break
+    return pairs
 
 
 def apply_replace_regexes(lines, replaces):
@@ -2294,6 +2315,28 @@ def run_selftest(options) -> int:
     check("leading space tolerated",
           compare_lines(["  a"], ["a"], ignore_leading=True) is None
           and compare_lines(["  a"], ["a"]) == 0)
+
+    # --replace_regex: one pair, a trailing mtr flag, several pairs on one line,
+    # and a back reference in the replacement
+    single = parse_replace_regex("/_[0-9]+/_0/")
+    check("replace_regex single pair", len(single) == 1
+          and apply_replace_regexes(["a_12"], single) == ["a_0"], single)
+    flagged = parse_replace_regex("/__vid_[0-9]+/__vid_0/g")
+    check("replace_regex tolerates the g flag",
+          len(flagged) == 1 and apply_replace_regexes(["x__vid_12"], flagged) == ["x__vid_0"],
+          flagged)
+    multi = parse_replace_regex(
+        "/__vid_[0-9]+(_[0-9]+)?/__vid_0/g /__type_[0-9]+_[0-9]+/__type_0_0/g")
+    check("replace_regex multiple pairs", len(multi) == 2, multi)
+    if len(multi) == 2:
+        check("replace_regex multiple pairs applied",
+              apply_replace_regexes(["__vid_12_7 __type_3_9"], multi)
+              == ["__vid_0 __type_0_0"])
+    backref = parse_replace_regex("/output\\(\\[F\\(([^)]+)\\)\\]\\)/output([\\1])/g")
+    check("replace_regex back reference",
+          len(backref) == 1
+          and apply_replace_regexes(["output([F(x)])"], backref) == ["output([x])"],
+          backref)
 
     try:
         script_path.unlink()

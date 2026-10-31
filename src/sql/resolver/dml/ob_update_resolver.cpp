@@ -15,6 +15,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "lib/allocator/page_arena.h"
+#include "share/ai_service/ob_ai_column_schema.h"
 #include "sql/resolver/dml/ob_update_resolver.h"
 
 namespace oceanbase
@@ -24,6 +26,66 @@ using namespace share;
 using namespace share::schema;
 namespace sql
 {
+
+namespace
+{
+
+// Column ids referenced by the AI expression of `ai_column`. The spec of an AI column lives in
+// the comment of its result-spec hidden column, see share/ai_service/ob_ai_column_schema.h.
+// Mirrors ObDmlCgService::get_ai_dependency_column_ids().
+int get_ai_dependency_column_ids(common::ObIAllocator &alloc,
+                                 const ObTableSchema &table_schema,
+                                 const ObColumnSchemaV2 &ai_column,
+                                 common::ObIArray<uint64_t> &dep_column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObString spec_column_name;
+  const ObColumnSchemaV2 *spec_column = NULL;
+  share::ObAiColumnInfo ai_info;
+  dep_column_ids.reuse();
+  if (OB_FAIL(share::build_ai_hidden_column_name(alloc,
+                                                 share::AI_RESULT_SPEC_COLUMN_PREFIX,
+                                                 ai_column.get_column_name_str(),
+                                                 spec_column_name))) {
+  } else if (OB_ISNULL(spec_column = table_schema.get_column_schema(spec_column_name))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the AI result spec column is missing", KR(ret), K(spec_column_name));
+  } else if (OB_FAIL(share::parse_ai_column_spec_text(alloc,
+                                                      spec_column->get_comment_str(),
+                                                      ai_info))) {
+    LOG_WARN("fail to parse the AI column spec", KR(ret), K(spec_column_name));
+  } else {
+    // dep_columns is a comma separated column name list
+    const ObString &deps = ai_info.dep_columns_;
+    int64_t pos = 0;
+    while (OB_SUCC(ret) && pos < deps.length()) {
+      int64_t name_len = 0;
+      while (pos + name_len < deps.length() && ',' != deps.ptr()[pos + name_len]) {
+        ++name_len;
+      }
+      ObString dep_name;
+      dep_name.assign_ptr(deps.ptr() + pos, static_cast<int32_t>(name_len));
+      pos += name_len + 1;
+      // trim spaces
+      while (!dep_name.empty() && ' ' == dep_name.ptr()[0]) {
+        dep_name.assign_ptr(dep_name.ptr() + 1, dep_name.length() - 1);
+      }
+      while (!dep_name.empty() && ' ' == dep_name.ptr()[dep_name.length() - 1]) {
+        dep_name.assign_ptr(dep_name.ptr(), dep_name.length() - 1);
+      }
+      const ObColumnSchemaV2 *dep_column = NULL;
+      if (dep_name.empty()) {
+        // empty item, e.g. a trailing comma
+      } else if (OB_ISNULL(dep_column = table_schema.get_column_schema(dep_name))) {
+        LOG_TRACE("the AI dependency column is gone", K(dep_name));
+      } else if (OB_FAIL(dep_column_ids.push_back(dep_column->get_column_id()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+} // anonymous namespace
 ObUpdateResolver::ObUpdateResolver(ObResolverParams &param)
   : ObDelUpdResolver(param)
 {
@@ -87,6 +149,7 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     } else if (OB_FAIL(resolve_assignments(*assign_list,
                                            tables_assign,
                                            current_scope_))) {
+    } else if (OB_FAIL(add_ai_invalidation_assignments(tables_assign))) {
     }
   }
 
@@ -149,6 +212,166 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     } else if (OB_FAIL(update_stmt->check_dml_source_from_join())) {
     } else if (OB_FAIL(check_safe_update_mode(update_stmt))) {
     } else { /*do nothing*/ }
+  }
+  return ret;
+}
+
+// An AI column is the cached result of an AI expression over its dependency columns, so a
+// statement that changes one of those columns (or the rowkey, which moves the pending work item
+// to another row key) has to invalidate the cached result. The invalidation is materialized here,
+// at resolve time, as an ordinary `<ai_column> = NULL` assignment, and not by resetting the row
+// image while the row is executed: a real assignment gives the DML consistent old/new row images
+// (the AI column expression is no longer its own old value), a new version of the vector index
+// row key, and it lets the ordinary update path maintain every index the AI column takes part in.
+int ObUpdateResolver::add_ai_invalidation_assignments(ObIArray<ObTableAssignment> &table_assigns)
+{
+  int ret = OB_SUCCESS;
+  ObUpdateStmt *update_stmt = get_update_stmt();
+  ObArenaAllocator ai_alloc(ObModIds::OB_SQL_EXPR);
+  if (OB_ISNULL(update_stmt) || OB_ISNULL(schema_checker_) || OB_ISNULL(params_.expr_factory_)
+      || OB_ISNULL(params_.allocator_) || OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid update resolver context", KR(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_assigns.count(); ++i) {
+    ObTableAssignment &table_assign = table_assigns.at(i);
+    const TableItem *table_item = NULL;
+    const ObTableSchema *table_schema = NULL;
+    ObSEArray<uint64_t, 8> assigned_ids;
+    ObSEArray<uint64_t, 4> dep_column_ids;
+    ObSEArray<const ObColumnSchemaV2 *, 4> invalidated_columns;
+    bool rowkey_changed = false;
+    if (OB_ISNULL(table_item = update_stmt->get_table_item_by_id(table_assign.table_id_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the table item of the updated table is missing", KR(ret),
+               K(table_assign.table_id_));
+    } else if (!table_item->is_basic_table()) {
+      // an updatable view does not expose the AI columns of its base table
+    } else if (OB_FAIL(schema_checker_->get_table_schema(table_item->get_base_table_item().ref_id_,
+                                                         table_schema))) {
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!table_schema->is_user_table()) {
+      // AI columns only exist on user tables
+    } else {
+      // 1. the column ids this statement writes
+      for (int64_t j = 0; OB_SUCC(ret) && j < table_assign.assignments_.count(); ++j) {
+        const ObColumnRefRawExpr *column_expr = table_assign.assignments_.at(j).column_expr_;
+        const ColumnItem *column_item = NULL;
+        uint64_t column_id = OB_INVALID_ID;
+        if (OB_ISNULL(column_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("the assigned column expr is null", KR(ret));
+        } else if (OB_NOT_NULL(column_item = update_stmt->get_column_item_by_id(
+                     column_expr->get_table_id(), column_expr->get_column_id()))) {
+          // a view column is assigned, the base column is the one that changes
+          column_id = column_item->base_cid_;
+        } else {
+          column_id = column_expr->get_column_id();
+        }
+        if (OB_SUCC(ret) && !has_exist_in_array(assigned_ids, column_id)
+            && OB_FAIL(assigned_ids.push_back(column_id))) {
+        }
+      }
+      // 2. a rowkey change invalidates every AI column of the table
+      if (OB_SUCC(ret)) {
+        const ObRowkeyInfo &rowkey_info = table_schema->get_rowkey_info();
+        for (int64_t j = 0; OB_SUCC(ret) && !rowkey_changed && j < rowkey_info.get_size(); ++j) {
+          const ObRowkeyColumn *rowkey_column = rowkey_info.get_column(j);
+          if (OB_ISNULL(rowkey_column)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            rowkey_changed = has_exist_in_array(assigned_ids, rowkey_column->column_id_);
+          }
+        }
+      }
+      // 3. collect the AI columns whose dependency columns are written
+      for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+           OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+        const ObColumnSchemaV2 *ai_column = *iter;
+        bool invalidated = false;
+        if (OB_ISNULL(ai_column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (!ai_column->is_ai_column()) {
+          // skip normal columns
+        } else if (rowkey_changed) {
+          invalidated = true;
+        } else if (OB_FAIL(get_ai_dependency_column_ids(ai_alloc, *table_schema, *ai_column,
+                                                        dep_column_ids))) {
+        } else {
+          for (int64_t j = 0; !invalidated && j < dep_column_ids.count(); ++j) {
+            invalidated = has_exist_in_array(assigned_ids, dep_column_ids.at(j));
+          }
+        }
+        // a statement that already writes the AI column itself, i.e. the AI column worker
+        // publishing a model result, has nothing to invalidate
+        if (OB_SUCC(ret) && invalidated
+            && has_exist_in_array(assigned_ids, ai_column->get_column_id())) {
+          invalidated = false;
+        }
+        if (OB_SUCC(ret) && invalidated && OB_FAIL(invalidated_columns.push_back(ai_column))) {
+        }
+      }
+      // 4. materialize the invalidation as `<ai_column> = NULL`
+      for (int64_t j = 0; OB_SUCC(ret) && j < invalidated_columns.count(); ++j) {
+        if (OB_FAIL(add_ai_column_null_assignment(*table_item, *invalidated_columns.at(j),
+                                                  table_assigns))) {
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObUpdateResolver::add_ai_column_null_assignment(const TableItem &table_item,
+                                                    const ObColumnSchemaV2 &ai_column,
+                                                    ObIArray<ObTableAssignment> &table_assigns)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObColumnRefRawExpr *, 1> column_exprs;
+  ObColumnRefRawExpr *ai_column_expr = NULL;
+  ObConstRawExpr *null_const_expr = NULL;
+  ObRawExpr *null_expr = NULL;
+  const ColumnItem *column_item = NULL;
+  if (OB_ISNULL(params_.expr_factory_) || OB_ISNULL(params_.allocator_)
+      || OB_ISNULL(session_info_) || OB_ISNULL(get_update_stmt())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid update resolver context", KR(ret));
+  } else if (OB_FAIL(add_column_to_stmt(table_item, ai_column, column_exprs))) {
+  } else if (column_exprs.empty() || OB_ISNULL(ai_column_expr = column_exprs.at(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("fail to add the AI column to the statement", KR(ret),
+             K(ai_column.get_column_name_str()));
+  } else if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_NULL, null_const_expr))) {
+  } else if (OB_ISNULL(null_const_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ObObjParam null_value;
+    null_value.set_null();
+    null_value.set_param_meta();
+    null_const_expr->set_value(null_value);
+    null_expr = null_const_expr;
+    // cast NULL to the type of the AI column, exactly like a user written assignment
+    if (OB_FAIL(ObRawExprUtils::build_column_conv_expr(*params_.expr_factory_,
+                                                       *params_.allocator_,
+                                                       *ai_column_expr,
+                                                       null_expr,
+                                                       session_info_))) {
+    } else if (OB_ISNULL(column_item = get_update_stmt()->get_column_item_by_id(
+                 table_item.table_id_, ai_column.get_column_id()))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the column item of the AI column is missing", KR(ret),
+               K(ai_column.get_column_name_str()));
+    } else {
+      // is_implicit_: this write is not a user write of an AI column, so it must neither be
+      // rejected (see ObDmlCgService::check_ai_column_not_written()) nor printed back
+      ObAssignment assignment;
+      assignment.column_expr_ = ai_column_expr;
+      assignment.expr_ = null_expr;
+      assignment.is_implicit_ = true;
+      if (OB_FAIL(add_assignment(table_assigns, &table_item, column_item, assignment))) {
+      }
+    }
   }
   return ret;
 }
