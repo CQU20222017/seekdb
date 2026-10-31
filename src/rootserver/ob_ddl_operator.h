@@ -194,6 +194,10 @@ public:
                            const int64_t new_schema_version,
                            share::schema::ObTableSchema &new_table_schema,
                            const common::ObString &column_name);
+  // Write the __all_ai_column row of an AI column that was just added to the table.
+  int insert_ai_column(common::ObMySQLTransaction &trans,
+                       const share::schema::ObTableSchema &table_schema,
+                       const share::schema::ObColumnSchemaV2 &result_column);
   int batch_update_system_table_columns(
       common::ObMySQLTransaction &trans,
       const share::schema::ObTableSchema &orig_table_schema,

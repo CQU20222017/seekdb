@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_CG
 #include "ob_dml_cg_service.h"
+#include "share/ai_service/ob_ai_column_schema.h"
 #include "sql/code_generator/ob_static_engine_cg.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/parser/ob_parser.h"
@@ -1860,6 +1861,7 @@ int ObDmlCgService::generate_related_del_ctdef(ObLogDelUpd &op,
   return ret;
 }
 
+
 int ObDmlCgService::generate_das_upd_ctdef(ObLogDelUpd &op,
                                            ObTableID index_tid,
                                            const IndexDMLInfo &index_dml_info,
@@ -1872,14 +1874,27 @@ int ObDmlCgService::generate_das_upd_ctdef(ObLogDelUpd &op,
   const ObAssignments &assigns = index_dml_info.assignments_;
   ObArray<uint64_t> dml_column_ids;
   ObArray<uint64_t> minimal_column_ids;
+  ObSEArray<uint64_t, 4> ai_invalidation_cids;
+  ObSEArray<uint64_t, 8> updated_cids;
   bool need_all_columns = false;
   bool is_primary_table = false;
   if (index_dml_info.is_primary_index_ && index_tid == index_dml_info.ref_table_id_) {
     is_primary_table = true;
   }
   if (OB_FAIL(generate_das_dml_ctdef(op, index_tid, index_dml_info, das_upd_ctdef))) {
+  } else if (is_primary_table
+             && OB_FAIL(collect_ai_invalidation_column_ids(op.get_stmt(), index_dml_info,
+                                                           ai_invalidation_cids))) {
   } else if (OB_FAIL(generate_updated_column_ids(op, assigns, das_upd_ctdef.column_ids_,
-                                                 das_upd_ctdef.updated_column_ids_))) {
+                                                 updated_cids))) {
+  } else if (is_primary_table
+             && OB_FAIL(append_array_no_dup(updated_cids, ai_invalidation_cids))) {
+    // the AI columns that are invalidated by this statement must be part of the written
+    // columns, otherwise the DAS update op marks them as unchanged
+  } else if (FALSE_IT(das_upd_ctdef.updated_column_ids_.reset())) {
+  } else if (OB_FAIL(das_upd_ctdef.updated_column_ids_.assign(updated_cids))) {
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(generate_dml_column_ids(op, index_dml_info.column_exprs_, dml_column_ids))) {
   } else if (OB_FAIL(generate_minimal_upd_old_row_cid(op,
                                                       index_tid,
@@ -2130,6 +2145,8 @@ int ObDmlCgService::generate_dml_base_ctdef(ObLogicalOperator &op,
   if (OB_SUCC(ret)) {
     // Mark the ctdef as a main-table operation.
     dml_base_ctdef.das_base_ctdef_.is_access_main_table_ = true;
+  }
+  if (OB_SUCC(ret) && OB_FAIL(fill_ai_column_ctdef(op, index_dml_info, dml_base_ctdef))) {
   }
   return ret;
 }
@@ -2400,6 +2417,285 @@ int ObDmlCgService::convert_normal_triggers(ObLogDelUpd &log_op,
         //To support exception capture for triggers/UDFs, DML statements involving table data modification with triggers must be executed serially
         cg_.phy_plan_->set_need_serial_exec(true);
         cg_.phy_plan_->set_contain_pl_udf_or_trigger(true);
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDmlCgService::check_ai_column_not_written(ObLogicalOperator &op,
+                                                const IndexDMLInfo &index_dml_info,
+                                                const ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  // The AI column worker publishes a model result with an internal statement on the user
+  // table; that statement is the only one allowed to write an AI result column.
+  ObLogPlan *log_plan = op.get_plan();
+  ObSQLSessionInfo *session = NULL;
+  if (OB_NOT_NULL(log_plan)) {
+    session = log_plan->get_optimizer_context().get_session_info();
+  }
+  if (OB_NOT_NULL(session) && session->is_ai_column_worker()) {
+    return OB_SUCCESS;
+  }
+  // An UPDATE ... SET <ai_column> = ... is rejected: the AI column value is produced by the
+  // AI function only, otherwise the invalidation rule would conflict with the assignment.
+  for (int64_t i = 0; OB_SUCC(ret) && i < index_dml_info.assignments_.count(); ++i) {
+    const ObAssignment &assignment = index_dml_info.assignments_.at(i);
+    const ObColumnRefRawExpr *column_expr = assignment.column_expr_;
+    const ObColumnSchemaV2 *column = NULL;
+    if (NULL == column_expr || assignment.is_implicit_) {
+      // implicit assignments (e.g. added for internal use) are not user writes
+    } else if (NULL == (column = table_schema.get_column_schema(column_expr->get_column_id()))) {
+      // not a column of this table
+    } else if (column->is_ai_column()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an AI column directly");
+      LOG_WARN("AI column can not be written by DML directly", KR(ret),
+               K(column->get_column_name_str()));
+    }
+  }
+  // INSERT INTO t(..., <ai_column>, ...) is rejected as well.
+  if (OB_SUCC(ret)) {
+    const ObDMLStmt *stmt = op.get_stmt();
+    if (NULL != stmt && stmt->is_insert_stmt()) {
+      const ObInsertStmt *insert_stmt = static_cast<const ObInsertStmt *>(stmt);
+      const ObIArray<ObColumnRefRawExpr *> &values_desc = insert_stmt->get_values_desc();
+      for (int64_t i = 0; OB_SUCC(ret) && i < values_desc.count(); ++i) {
+        const ObColumnRefRawExpr *column_expr = values_desc.at(i);
+        const ObColumnSchemaV2 *column = NULL;
+        if (NULL == column_expr) {
+          // nothing to check
+        } else if (NULL == (column = table_schema.get_column_schema(column_expr->get_column_id()))) {
+          // not a column of this table
+        } else if (column->is_ai_column()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an AI column directly");
+          LOG_WARN("AI column can not be written by DML directly", KR(ret),
+                   K(column->get_column_name_str()));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Collect the AI result columns that this UPDATE statement has to invalidate: an AI column
+// is invalidated when one of its dependency columns is assigned, or when the rowkey of the
+// row changes (the task row of the old row key has to move to the new one).
+int ObDmlCgService::collect_ai_invalidation_column_ids(
+    const ObDMLStmt *stmt,
+    const IndexDMLInfo &index_dml_info,
+    common::ObIArray<uint64_t> &ai_column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard *schema_guard = NULL;
+  const ObTableSchema *table_schema = NULL;
+  ObArenaAllocator ai_alloc(ObModIds::OB_SQL_EXPR);
+  ObSEArray<uint64_t, 8> assigned_ids;
+  ObSEArray<uint64_t, 8> dep_column_ids;
+  bool rowkey_changed = false;
+  ai_column_ids.reuse();
+  if (OB_ISNULL(stmt) || OB_ISNULL(schema_guard = cg_.opt_ctx_->get_schema_guard())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid update compile context", KR(ret));
+  } else if (OB_FAIL(schema_guard->get_table_schema(index_dml_info.ref_table_id_, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!index_dml_info.is_primary_index_ || !table_schema->is_user_table()) {
+    // only the data table of the statement carries AI columns
+  } else {
+    // 1. the column ids written by this statement
+    for (int64_t i = 0; OB_SUCC(ret) && i < index_dml_info.assignments_.count(); ++i) {
+      const ObColumnRefRawExpr *column_expr = index_dml_info.assignments_.at(i).column_expr_;
+      const ColumnItem *column_item = NULL;
+      if (OB_ISNULL(column_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_ISNULL(column_item = stmt->get_column_item_by_id(column_expr->get_table_id(),
+                                                                    column_expr->get_column_id()))) {
+        // not a column item of this statement, use the column id directly
+        if (OB_FAIL(assigned_ids.push_back(column_expr->get_column_id()))) {
+        }
+      } else if (OB_FAIL(assigned_ids.push_back(column_item->base_cid_))) {
+      }
+    }
+    // 2. a rowkey change moves the task row of the old row key, and invalidates the value
+    if (OB_SUCC(ret)) {
+      const ObRowkeyInfo &rowkey_info = table_schema->get_rowkey_info();
+      for (int64_t i = 0; OB_SUCC(ret) && !rowkey_changed && i < rowkey_info.get_size(); ++i) {
+        const ObRowkeyColumn *rowkey_column = rowkey_info.get_column(i);
+        if (OB_ISNULL(rowkey_column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          rowkey_changed = has_exist_in_array(assigned_ids, rowkey_column->column_id_);
+        }
+      }
+    }
+    // 3. collect the AI columns that have to be invalidated; they must also be written by
+    //    this update, otherwise the DAS update op marks them as unchanged
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *ai_column = *iter;
+      bool need_invalidate = false;
+      if (OB_ISNULL(ai_column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!ai_column->is_ai_column()) {
+        // skip normal columns
+      } else if (rowkey_changed) {
+        need_invalidate = true;
+      } else if (OB_FAIL(get_ai_dependency_column_ids(ai_alloc, *table_schema, *ai_column,
+                                                      dep_column_ids))) {
+      } else {
+        for (int64_t i = 0; !need_invalidate && i < dep_column_ids.count(); ++i) {
+          need_invalidate = has_exist_in_array(assigned_ids, dep_column_ids.at(i));
+        }
+      }
+      if (OB_SUCC(ret) && need_invalidate
+          && OB_FAIL(ai_column_ids.push_back(ai_column->get_column_id()))) {
+        LOG_WARN("fail to collect the AI column to invalidate", KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDmlCgService::get_ai_dependency_column_ids(common::ObIAllocator &alloc,
+                                                 const ObTableSchema &table_schema,
+                                                 const ObColumnSchemaV2 &ai_column,
+                                                 ObIArray<uint64_t> &dep_column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObString spec_column_name;
+  const ObColumnSchemaV2 *spec_column = NULL;
+  share::ObAiColumnInfo ai_info;
+  dep_column_ids.reuse();
+  if (OB_FAIL(share::build_ai_hidden_column_name(alloc,
+                                                 share::AI_RESULT_SPEC_COLUMN_PREFIX,
+                                                 ai_column.get_column_name_str(),
+                                                 spec_column_name))) {
+  } else if (OB_ISNULL(spec_column = table_schema.get_column_schema(spec_column_name))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the AI result spec column is missing", KR(ret),
+             K(ai_column.get_column_name_str()));
+  } else if (OB_FAIL(share::parse_ai_column_spec_text(alloc,
+                                                      spec_column->get_comment_str(),
+                                                      ai_info))) {
+    LOG_WARN("fail to parse the AI column spec", KR(ret),
+             K(ai_column.get_column_name_str()));
+  } else {
+    // dep_columns is a comma separated column name list
+    const ObString &deps = ai_info.dep_columns_;
+    int64_t pos = 0;
+    while (OB_SUCC(ret) && pos < deps.length()) {
+      int64_t name_len = 0;
+      while (pos + name_len < deps.length() && ',' != deps.ptr()[pos + name_len]) {
+        ++name_len;
+      }
+      ObString dep_name;
+      dep_name.assign_ptr(deps.ptr() + pos, static_cast<int32_t>(name_len));
+      pos += name_len + 1;
+      // trim spaces
+      while (!dep_name.empty() && ' ' == dep_name.ptr()[0]) {
+        dep_name.assign_ptr(dep_name.ptr() + 1, dep_name.length() - 1);
+      }
+      while (!dep_name.empty() && ' ' == dep_name.ptr()[dep_name.length() - 1]) {
+        dep_name.assign_ptr(dep_name.ptr(), dep_name.length() - 1);
+      }
+      const ObColumnSchemaV2 *dep_column = NULL;
+      if (dep_name.empty()) {
+        // empty item, e.g. a trailing comma
+      } else if (OB_ISNULL(dep_column = table_schema.get_column_schema(dep_name))) {
+        LOG_TRACE("the AI dependency column is gone", K(dep_name), K(ret));
+      } else if (OB_FAIL(dep_column_ids.push_back(dep_column->get_column_id()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDmlCgService::fill_ai_column_ctdef(ObLogicalOperator &op,
+                                         const IndexDMLInfo &index_dml_info,
+                                         ObDMLBaseCtDef &dml_base_ctdef)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard *schema_guard = NULL;
+  const ObTableSchema *table_schema = NULL;
+  ObLogPlan *log_plan = op.get_plan();
+  if (!index_dml_info.is_primary_index_) {
+    // The AI column work belongs to the data table ctdef only, index ctdefs share it.
+  } else if (OB_ISNULL(log_plan)
+             || OB_ISNULL(schema_guard = log_plan->get_optimizer_context().get_schema_guard())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_guard->get_table_schema(index_dml_info.ref_table_id_, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!table_schema->is_user_table()) {
+    // AI columns only exist on user tables
+  } else {
+    // The fixed arrays must reserve their capacity before push_back(), otherwise
+    // push_back() answers OB_NOT_INIT.
+    dml_base_ctdef.ai_column_ids_.set_capacity(table_schema->get_column_count());
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!column->is_ai_column()) {
+        // skip normal columns
+      } else if (OB_FAIL(dml_base_ctdef.ai_column_ids_.push_back(column->get_column_id()))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !dml_base_ctdef.ai_column_ids_.empty()) {
+    ObSEArray<uint64_t, 4> rowkey_column_ids;
+    ObSqlString rowkey_names;
+    if (OB_FAIL(check_ai_column_not_written(op, index_dml_info, *table_schema))) {
+    } else if (OB_FAIL(table_schema->get_rowkey_column_ids(rowkey_column_ids))) {
+    } else {
+      dml_base_ctdef.ai_rowkey_column_ids_.set_capacity(rowkey_column_ids.count());
+      dml_base_ctdef.ai_rowkey_column_types_.set_capacity(rowkey_column_ids.count());
+    }
+    // An UPDATE only invalidates the AI columns whose dependency columns are assigned (or
+    // whose rowkey changes), INSERT and DELETE need every AI column of the table.
+    if (OB_SUCC(ret) && DAS_OP_TABLE_UPDATE == dml_base_ctdef.dml_type_) {
+      ObSEArray<uint64_t, 4> invalidated_ids;
+      ObSEArray<uint64_t, 4> kept_ids;
+      if (OB_FAIL(collect_ai_invalidation_column_ids(op.get_stmt(), index_dml_info, invalidated_ids))) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < dml_base_ctdef.ai_column_ids_.count(); ++i) {
+          if (has_exist_in_array(invalidated_ids, dml_base_ctdef.ai_column_ids_.at(i))
+              && OB_FAIL(kept_ids.push_back(dml_base_ctdef.ai_column_ids_.at(i)))) {
+            LOG_WARN("fail to keep the invalidated AI column", KR(ret));
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        dml_base_ctdef.ai_column_ids_.reset();
+        dml_base_ctdef.ai_column_ids_.set_capacity(kept_ids.count());
+        if (OB_FAIL(append_array_no_dup(dml_base_ctdef.ai_column_ids_, kept_ids))) {
+        }
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_column_ids.count(); ++i) {
+      const ObColumnSchemaV2 *column = table_schema->get_column_schema(rowkey_column_ids.at(i));
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_hidden()) {
+        // a hidden primary key has no user visible predicate
+      } else if (OB_FAIL(dml_base_ctdef.ai_rowkey_column_ids_.push_back(column->get_column_id()))
+                 || OB_FAIL(dml_base_ctdef.ai_rowkey_column_types_.push_back(
+                     static_cast<uint64_t>(column->get_data_type())))
+                 || (rowkey_names.length() > 0 && OB_FAIL(rowkey_names.append(",")))
+                 || OB_FAIL(rowkey_names.append(column->get_column_name_str()))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ObString names;
+      if (OB_FAIL(ob_write_string(cg_.phy_plan_->get_allocator(), rowkey_names.string(), names))) {
+      } else {
+        // The AI column task rows are written by an extra DAS task of the DML operator, so no
+        // nested statement / inner connection is needed here any more.
+        dml_base_ctdef.ai_rowkey_column_names_ = names;
       }
     }
   }

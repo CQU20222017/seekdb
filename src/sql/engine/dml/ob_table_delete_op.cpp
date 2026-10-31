@@ -276,6 +276,9 @@ int ObTableDeleteOp::write_rows_post_proc(int last_errno)
       if (OB_FAIL(check_delete_affected_row())) {
       }
     }
+    // Drop the AI column task rows of the deleted rows, in the same transaction.
+    if (OB_SUCC(ret) && OB_FAIL(flush_ai_column_tasks())) {
+    }
   }
   return ret;
 }

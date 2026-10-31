@@ -529,6 +529,22 @@ protected:
                                                      bool& is_set_cur_default);
   int resolve_normal_column_attribute_constr_null(ObColumnSchemaV2 &column,
                                                   ObColumnResolveStat &resolve_stat);
+  // ---- AI COLUMN ----
+  // An AI COLUMN definition keeps the 7-child T_COLUMN_DEFINITION layout of a generated
+  // column, but stores a T_AI_COLUMN_DEFINITION payload in the last child.
+  static bool is_ai_column_node(const ParseNode *node);
+  // Validate the AI COLUMN definition of `node` against the resolved `column`, and build
+  // the spec text that is persisted in the comment of the result-spec hidden column.
+  int resolve_ai_column_spec(ParseNode *node,
+                             share::schema::ObColumnSchemaV2 &column,
+                             const ObTableSchema &table_schema,
+                             common::ObString &spec_text);
+  // Build one of the three hidden columns generated for an AI column.
+  // `kind` is AI_STATE_COLUMN_FLAG / AI_REQUEST_COLUMN_FLAG / AI_RESULT_SPEC_COLUMN_FLAG.
+  int build_ai_hidden_column(const share::schema::ObColumnSchemaV2 &result_column,
+                             const common::ObString &spec_text,
+                             const int64_t kind,
+                             share::schema::ObColumnSchemaV2 &hidden_column);
   int resolve_normal_column_attribute(share::schema::ObColumnSchemaV2 &column,
                                       ParseNode *attrs_node,
                                       ObColumnResolveStat &reslove_stat,

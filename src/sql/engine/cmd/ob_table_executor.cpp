@@ -42,6 +42,9 @@
 
 #include "sql/printer/ob_select_stmt_printer.h"
 #include "share/ob_structured_event_logger.h"
+#include "share/ai_service/ob_ai_column_schema.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "observer/ob_inner_sql_connection.h"
 namespace oceanbase
 {
 using namespace common;
@@ -751,6 +754,311 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+namespace {
+// `status` is a retry-only pseudo column: an unquoted STATUS identifier of the retry predicate
+// refers to the AI state hidden column, while a backtick quoted one keeps pointing at the
+// business column of the same name. The rewrite works at the token level and never touches
+// string literals, so it cannot corrupt a value.
+const int BACKQUOTE = 96;
+
+int translate_ai_retry_predicate(const common::ObString &predicate,
+                                 const common::ObString &state_column,
+                                 common::ObSqlString &out)
+{
+  int ret = OB_SUCCESS;
+  const int64_t len = predicate.length();
+  const char *p = predicate.ptr();
+  int64_t i = 0;
+  while (OB_SUCC(ret) && i < len) {
+    const char c = p[i];
+    if ('\'' == c || '"' == c) {
+      const char quote = c;
+      while (OB_SUCC(ret) && i < len) {
+        if (OB_FAIL(out.append(p + i, 1))) {
+        } else if (quote != p[i]) {
+          ++i;
+        } else if (i + 1 < len && quote == p[i + 1]) {
+          if (OB_FAIL(out.append(p + i + 1, 1))) {
+          } else {
+            i += 2;
+          }
+        } else {
+          ++i;
+          break;
+        }
+      }
+    } else if (BACKQUOTE == c) {
+      if (OB_FAIL(out.append(p + i, 1))) {
+      } else {
+        ++i;
+        while (OB_SUCC(ret) && i < len && BACKQUOTE != p[i]) {
+          if (OB_FAIL(out.append(p + i, 1))) {
+          } else {
+            ++i;
+          }
+        }
+        if (OB_SUCC(ret) && i < len && OB_FAIL(out.append(p + i, 1))) {
+        } else {
+          ++i;
+        }
+      }
+    } else if (isalpha(static_cast<unsigned char>(c)) || '_' == c) {
+      const int64_t start = i;
+      while (i < len && (isalnum(static_cast<unsigned char>(p[i])) || '_' == p[i])) {
+        ++i;
+      }
+      const common::ObString ident(static_cast<int32_t>(i - start), p + start);
+      if (0 == ident.case_compare("status")) {
+        if (OB_FAIL(out.append(state_column.ptr(), state_column.length()))) {
+        }
+      } else if (OB_FAIL(out.append(ident.ptr(), ident.length()))) {
+      }
+    } else if (OB_FAIL(out.append(p + i, 1))) {
+    } else {
+      ++i;
+    }
+  }
+  return ret;
+}
+
+int append_rowkey_literal(common::ObSqlString &out, const common::ObString &value,
+                          const bool need_quote)
+{
+  int ret = OB_SUCCESS;
+  if (!need_quote) {
+    if (OB_FAIL(out.append(value.ptr(), value.length()))) {
+    }
+  } else if (OB_FAIL(out.append("'", 1))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+      if ('\'' == value.ptr()[i]) {
+        if (OB_FAIL(out.append("''", 2))) {
+        }
+      } else if (OB_FAIL(out.append(value.ptr() + i, 1))) {
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(out.append("'", 1))) {
+    }
+  }
+  return ret;
+}
+}  // namespace
+
+int ObAlterTableExecutor::execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  common::ObArenaAllocator allocator("AiColRetry");
+  // the guard of the exec context is not usable here: take a fresh runtime schema guard
+  share::schema::ObSchemaGetterGuard local_guard;
+  share::schema::ObSchemaGetterGuard *schema_guard = &local_guard;
+  const share::schema::ObTableSchema *table_schema = NULL;
+  const share::schema::ObDatabaseSchema *db_schema = NULL;
+  const uint64_t table_id = stmt.get_ai_retry_table_id();
+  const uint64_t column_id = stmt.get_ai_retry_column_id();
+  common::ObString first_stmt;
+  common::ObString state_column;
+  common::ObSqlString where_text;
+  common::ObSqlString sql;
+  sqlclient::ObISQLConnectionGuard guard;
+  sqlclient::ObISQLConnection *conn = NULL;
+  common::ObMySQLProxy *proxy = ctx.get_sql_proxy();
+  int64_t affected_rows = 0;
+  if (OB_ISNULL(schema_guard) || OB_ISNULL(proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_EXE_LOG(WARN, "invalid argument to run a retry ai column action", KR(ret),
+                KP(schema_guard), KP(proxy));
+  } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
+  } else if (OB_FAIL(share::build_ai_hidden_column_name(allocator,
+                                                        share::AI_STATE_COLUMN_PREFIX,
+                                                        stmt.get_ai_retry_column_name(),
+                                                        state_column))) {
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(local_guard))) {
+    SQL_EXE_LOG(WARN, "fail to get a runtime schema guard", KR(ret));
+  } else if (OB_FAIL(schema_guard->get_table_schema(table_id, table_schema))) {
+    SQL_EXE_LOG(WARN, "fail to get the table schema", KR(ret), K(table_id));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_guard->get_database_schema(table_schema->get_database_id(),
+                                                       db_schema))) {
+  } else if (OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // The predicate text comes from the parse node of the statement: the grammar action copies
+    // the exact input span, so no text search is needed here and comments / newlines / the
+    // trailing semicolon cannot leak into the generated statement.
+    common::ObString predicate = stmt.get_ai_retry_predicate();
+    int64_t pred_len = static_cast<int64_t>(predicate.length());
+    while (pred_len > 0
+           && (';' == predicate.ptr()[pred_len - 1]
+               || isspace(static_cast<unsigned char>(predicate.ptr()[pred_len - 1])))) {
+      --pred_len;
+    }
+    if (pred_len > 0) {
+      // the grammar hands over the whole `WHERE <pred>` span: drop the leading keyword
+      int64_t pred_off = 0;
+      while (pred_off < pred_len
+             && isspace(static_cast<unsigned char>(predicate.ptr()[pred_off]))) {
+        ++pred_off;
+      }
+      if (pred_off + 5 <= pred_len
+          && 0 == strncasecmp(predicate.ptr() + pred_off, "where", 5)) {
+        pred_off += 5;
+        while (pred_off < pred_len
+               && isspace(static_cast<unsigned char>(predicate.ptr()[pred_off]))) {
+          ++pred_off;
+        }
+      }
+      common::ObString trimmed;
+      trimmed.assign_ptr(predicate.ptr() + pred_off,
+                         static_cast<int32_t>(pred_len - pred_off));
+      if (!trimmed.empty()
+          && OB_FAIL(translate_ai_retry_predicate(trimmed, state_column, where_text))) {
+        SQL_EXE_LOG(WARN, "fail to translate the retry predicate", KR(ret), K(trimmed));
+      }
+    }
+    ObSEArray<uint64_t, 4> rowkey_ids;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(table_schema->get_rowkey_column_ids(rowkey_ids))) {
+      SQL_EXE_LOG(WARN, "fail to get the rowkey column ids", KR(ret), K(table_id));
+    } else if (OB_FAIL(proxy->acquire_connection(guard, 0))) {
+      SQL_EXE_LOG(WARN, "fail to acquire an inner sql connection", KR(ret));
+    } else if (OB_ISNULL(conn = guard.get_ptr())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (FALSE_IT(static_cast<observer::ObInnerSQLConnection *>(conn)->get_session().set_ai_column_worker(true))) {
+      // the retry runs in the AI column worker role: it may write the AI column and the
+      // AI hooks must stay out of the way (no re-invalidation while retrying)
+    } else if (OB_FAIL(sql.assign_fmt("select "))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_ids.count(); ++i) {
+        const share::schema::ObColumnSchemaV2 *column =
+            table_schema->get_column_schema(rowkey_ids.at(i));
+        if (OB_ISNULL(column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(sql.append_fmt("%s%.*s", 0 == i ? "" : ", ",
+                                          column->get_column_name_str().length(),
+                                          column->get_column_name_str().ptr()))) {
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(sql.append_fmt(" from %.*s.%.*s",
+                                        db_schema->get_database_name_str().length(),
+                                        db_schema->get_database_name_str().ptr(),
+                                        table_schema->get_table_name_str().length(),
+                                        table_schema->get_table_name_str().ptr()))) {
+      } else if (!where_text.empty() && OB_FAIL(sql.append_fmt(" where %.*s",
+                                                               where_text.length(),
+                                                               where_text.ptr()))) {
+      }
+    }
+    common::ObISQLClient::ReadResult res;
+    ObSEArray<common::ObSqlString *, 8> rowkeys;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(conn->execute_read(sql.ptr(), res))) {
+      SQL_EXE_LOG(WARN, "fail to select the rows to retry", KR(ret), K(sql));
+    } else {
+      sqlclient::ObMySQLResult *result = res.get_result();
+      if (OB_ISNULL(result)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+      while (OB_SUCC(ret)) {
+        const int next_ret = result->next();
+        if (OB_ITER_END == next_ret) {
+          break;
+        } else if (OB_SUCCESS != next_ret) {
+          ret = next_ret;
+          SQL_EXE_LOG(WARN, "fail to read the rows to retry", KR(ret));
+        } else {
+          common::ObSqlString *rowkey = NULL;
+          if (OB_ISNULL(rowkey = static_cast<common::ObSqlString *>(
+                            allocator.alloc(sizeof(common::ObSqlString))))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            new (rowkey) common::ObSqlString();
+            for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_ids.count(); ++i) {
+              const share::schema::ObColumnSchemaV2 *column =
+                  table_schema->get_column_schema(rowkey_ids.at(i));
+              common::ObString value;
+              char int_buf[64];
+              int64_t int_pos = 0;
+              bool need_quote = true;
+              if (OB_ISNULL(column)) {
+                ret = OB_ERR_UNEXPECTED;
+              } else if (ob_is_integer_type(column->get_data_type())) {
+                int64_t int_val = 0;
+                if (OB_FAIL(result->get_int(i, int_val))) {
+                  SQL_EXE_LOG(WARN, "fail to read a rowkey value", KR(ret));
+                } else if (OB_FAIL(databuff_printf(int_buf, sizeof(int_buf), int_pos,
+                                                   "%ld", int_val))) {
+                } else {
+                  value.assign_ptr(int_buf, static_cast<int32_t>(int_pos));
+                  need_quote = false;
+                }
+              } else if (OB_FAIL(result->get_varchar(i, value))) {
+                SQL_EXE_LOG(WARN, "fail to read a rowkey value", KR(ret));
+              }
+              if (OB_FAIL(ret)) {
+              } else if (OB_FAIL(rowkey->append_fmt("%s%c%.*s%c = ", 0 == i ? "" : " and ",
+                                                    BACKQUOTE,
+                                                    column->get_column_name_str().length(),
+                                                    column->get_column_name_str().ptr(),
+                                                    BACKQUOTE))) {
+              } else if (OB_FAIL(append_rowkey_literal(*rowkey, value, need_quote))) {
+              }
+            }
+            if (OB_FAIL(ret)) {
+            } else if (OB_FAIL(rowkeys.push_back(rowkey))) {
+            }
+          }
+        }
+      }
+      const int close_ret = res.close();
+      if (OB_SUCCESS != close_ret && OB_SUCC(ret)) {
+        ret = close_ret;
+      }
+      // the connection rejects a new statement while the previous result still refers to it
+      res.reset();
+    }
+    // 2. invalidate the result column and reset the state marker of the matched rows
+    if (OB_FAIL(ret) || rowkeys.empty()) {
+      // nothing matched: a no-op, no work item is created
+    } else if (OB_FAIL(sql.assign_fmt("update %.*s.%.*s set %.*s = null, %.*s = 'PENDING'",
+                     db_schema->get_database_name_str().length(),
+                     db_schema->get_database_name_str().ptr(),
+                     table_schema->get_table_name_str().length(),
+                     table_schema->get_table_name_str().ptr(),
+                     stmt.get_ai_retry_column_name().length(),
+                     stmt.get_ai_retry_column_name().ptr(),
+                     state_column.length(), state_column.ptr()))) {
+    } else if (!where_text.empty() && OB_FAIL(sql.append_fmt(" where %.*s",
+                                                             where_text.length(),
+                                                             where_text.ptr()))) {
+    } else if (OB_FAIL(conn->execute_write(sql.ptr(), affected_rows))) {
+      SQL_EXE_LOG(WARN, "fail to invalidate the ai column", KR(ret), K(sql));
+    } else {
+      // 3. enqueue one work item per matched row
+      const int64_t now_us = common::ObTimeUtility::current_time();
+      for (int64_t i = 0; OB_SUCC(ret) && i < rowkeys.count(); ++i) {
+        common::ObString rowkey;
+        rowkey.assign_ptr(rowkeys.at(i)->ptr(), static_cast<int32_t>(rowkeys.at(i)->length()));
+        if (OB_FAIL(sql.assign_fmt(
+                "insert into oceanbase.__all_ai_column_task (table_id, column_id, "
+                "rowkey_predicate, eligible_ts, state, request_id, retry_count, gmt_create, "
+                "gmt_modified) values (%lu, %lu, '%.*s', now(6), 0, '%lu:%.*s:%ld', 0, "
+                "now(6), now(6)) on duplicate key update eligible_ts = now(6), state = 0, "
+                "request_id = '%lu:%.*s:%ld', retry_count = 0, claim_ts = null, "
+                "gmt_modified = now(6)",
+                table_id, column_id, rowkey.length(), rowkey.ptr(),
+                table_id, rowkey.length(), rowkey.ptr(), now_us,
+                table_id, rowkey.length(), rowkey.ptr(), now_us))) {
+        } else if (OB_FAIL(conn->execute_write(sql.ptr(), affected_rows))) {
+          SQL_EXE_LOG(WARN, "fail to enqueue an ai column work item", KR(ret), K(sql));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
@@ -762,6 +1070,10 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   OV (OB_NOT_NULL(task_exec_ctx = GET_SQL_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
   if (OB_FAIL(ret)) {
     // do nothing
+  } else if (stmt.has_ai_column_retry()) {
+    // RETRY AI COLUMN is a control action: run it here instead of creating a DDL job
+    if (OB_FAIL(execute_ai_column_retry(ctx, stmt))) {
+    }
   } else if (stmt.is_alter_triggers()) {
     if (stmt.get_tg_arg().trigger_infos_.count() > 0) {
       stmt.get_tg_arg().ddl_stmt_str_ = first_stmt;

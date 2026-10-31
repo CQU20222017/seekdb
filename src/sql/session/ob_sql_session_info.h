@@ -626,6 +626,12 @@ public:
   {
     return inner_flag_;
   }
+  // Set on the inner session that the AI column worker uses to publish a model result back
+  // into the user table. It is the only session allowed to write an AI column directly (see
+  // ObDmlCgService::check_ai_column_not_written) and the DML AI hooks are disabled on it,
+  // otherwise every published value would schedule the next AI column work item.
+  bool is_ai_column_worker() const { return is_ai_column_worker_; }
+  void set_ai_column_worker(bool v) { is_ai_column_worker_ = v; }
   void reset_audit_record(bool need_retry = false)
   {
     if (!need_retry) {
@@ -909,6 +915,8 @@ private:
   // in_transaction_ has been merged into trans_flags_.
 //  int64_t has_write_stmt_in_trans_;
   bool inner_flag_; // whether it is a virtual session for an internal request
+  // see is_ai_column_worker()
+  bool is_ai_column_worker_;
   // After version 2.2, this variable is no longer used
   bool is_max_availability_mode_;
   typedef common::hash::ObHashMap<ObPsStmtId, ObPsSessionInfo *,

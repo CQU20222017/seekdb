@@ -1933,6 +1933,7 @@ constexpr int OB_ERR_INVALID_DATE_MSG_FMT_V2 = -4219;
 #define OB_DUPLICATE_OBJECT_NAME_EXIST__USER_ERROR_MSG "Duplicate object name exists, schema refreshing may be hung"
 #define OB_ERR_REFRESH_SCHEMA_TOO_LONG__USER_ERROR_MSG "Refresh schema failed continuously, ddl may be hung"
 #define OB_ERR_INVALID_JSON_TEXT__USER_ERROR_MSG "Invalid JSON text."
+#define OB_ERR_AI_COLUMN_UNFINISHED_TASK__USER_ERROR_MSG "AI column has unfinished tasks for table_id=%lu, column_id=%lu"
 #define OB_ERR_INVALID_JSON_TEXT_IN_PARAM__USER_ERROR_MSG "Invalid JSON text in argument."
 #define OB_ERR_INVALID_JSON_BINARY_DATA__USER_ERROR_MSG "The JSON binary value contains invalid data."
 #define OB_ERR_INVALID_JSON_PATH__USER_ERROR_MSG "Invalid JSON path expression."
@@ -2769,7 +2770,7 @@ constexpr int OB_ERR_INVALID_DATE_MSG_FMT_V2 = -4219;
 #define OB_ERR_DATA_TOO_LONG_MSG_FMT_V2__USER_ERROR_MSG "Data too long for column '%.*s' at row %ld"
 #define OB_ERR_INVALID_DATE_MSG_FMT_V2__USER_ERROR_MSG "Incorrect datetime value for column '%.*s' at row %ld"
 
-extern int g_all_ob_errnos[1545];
+extern int g_all_ob_errnos[1546];
 
   const char *ob_error_name(const int oberr);
   const char* ob_error_cause(const int oberr);

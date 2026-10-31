@@ -51,6 +51,24 @@ public:
   bool is_alter_system() const { return is_alter_system_; }
   void set_is_alter_system(const bool flag) { is_alter_system_ = flag; }
 
+  // RETRY AI COLUMN: a control action executed outside of the DDL job machinery.
+  bool has_ai_column_retry() const { return has_ai_column_retry_; }
+  void set_ai_column_retry(const uint64_t table_id,
+                           const uint64_t column_id,
+                           const common::ObString &column_name,
+                           const common::ObString &predicate)
+  {
+    ai_retry_predicate_ = predicate;
+    set_table_id(table_id);
+    has_ai_column_retry_ = true;
+    ai_retry_table_id_ = table_id;
+    ai_retry_column_id_ = column_id;
+    ai_retry_column_name_ = column_name;
+  }
+  uint64_t get_ai_retry_table_id() const { return ai_retry_table_id_; }
+  uint64_t get_ai_retry_column_id() const { return ai_retry_column_id_; }
+  const common::ObString &get_ai_retry_column_name() const { return ai_retry_column_name_; }
+  const common::ObString &get_ai_retry_predicate() const { return ai_retry_predicate_; }
   bool is_alter_triggers() const { return is_alter_triggers_; }
   void set_is_alter_triggers(const bool flag) { is_alter_triggers_ = flag; }
 
@@ -113,6 +131,11 @@ private:
   bool is_alter_triggers_;
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
+  bool has_ai_column_retry_;
+  uint64_t ai_retry_table_id_;
+  uint64_t ai_retry_column_id_;
+  common::ObString ai_retry_column_name_;
+  common::ObString ai_retry_predicate_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;
 };
 

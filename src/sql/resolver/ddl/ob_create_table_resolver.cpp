@@ -137,6 +137,26 @@ int ObCreateTableResolver::add_hidden_tablet_seq_col()
   return ret;
 }
 
+int ObCreateTableResolver::add_ai_column_hidden_columns(
+    const ObColumnSchemaV2 &result_column,
+    const ObString &spec_text,
+    ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  const int64_t kinds[] = {AI_STATE_COLUMN_FLAG,
+                           AI_REQUEST_COLUMN_FLAG,
+                           AI_RESULT_SPEC_COLUMN_FLAG};
+  for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(kinds); ++i) {
+    ObColumnSchemaV2 hidden_column;
+    if (OB_FAIL(build_ai_hidden_column(result_column, spec_text, kinds[i], hidden_column))) {
+    } else if (FALSE_IT(hidden_column.set_column_id(gen_column_id()))) {
+    } else if (OB_FAIL(table_schema.add_column(hidden_column))) {
+      SQL_RESV_LOG(WARN, "fail to add AI hidden column", K(ret), K(hidden_column));
+    }
+  }
+  return ret;
+}
+
 // Set additional information for the temporary table
 int ObCreateTableResolver::set_temp_table_info(ObTableSchema &table_schema, ParseNode *commit_option_node)
 {
@@ -670,6 +690,11 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     }
 
     int64_t resolved_cols_count = resolved_cols.count();
+    // AI columns are collected during the column loop and their hidden columns are appended
+    // after every user column, so that the generated column ids stay ordered along the
+    // prev/next column chain (the storage layer relies on that).
+    ObSEArray<ObString, 4> ai_result_column_names;
+    ObSEArray<ObString, 4> ai_result_column_specs;
     // Second pass traversal, use resolved_cols to parse out all column schema and save to table_schema
     // And parse index etc
     for (int32_t i = 0, ele_pos = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
@@ -819,6 +844,15 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
             }
           }
 
+          // An AI column also generates three hidden columns, and the spec of the AI
+          // column is carried by the comment of the result-spec hidden column.
+          bool is_ai_column = ObDDLResolver::is_ai_column_node(element);
+          ObString ai_column_spec_text;
+          if (OB_SUCC(ret) && is_ai_column) {
+            if (OB_FAIL(resolve_ai_column_spec(element, column, table_schema, ai_column_spec_text))) {
+            }
+          }
+
           if (OB_SUCC(ret)) {
             ObColumnSchemaV2 *tmp_col = NULL;
             if (OB_FAIL(table_schema.add_column(column))) {
@@ -831,6 +865,12 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
               } else {
                 ret = OB_SUCCESS;
               }
+            }
+          }
+
+          if (OB_SUCC(ret) && is_ai_column) {
+            if (OB_FAIL(ai_result_column_names.push_back(column.get_column_name_str()))
+                || OB_FAIL(ai_result_column_specs.push_back(ai_column_spec_text))) {
             }
           }
 
@@ -881,6 +921,23 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         // won't be here
         ret = OB_ERR_UNEXPECTED;
         SQL_RESV_LOG(WARN, "unexpected branch", K(ret));
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      // Append the three generated hidden columns of every AI column now that all user
+      // columns have been added and assigned their column ids.
+      for (int64_t k = 0; OB_SUCC(ret) && k < ai_result_column_names.count(); ++k) {
+        const ObColumnSchemaV2 *ai_result_column = NULL;
+        if (OB_ISNULL(ai_result_column =
+                      table_schema.get_column_schema(ai_result_column_names.at(k)))) {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "AI column is missing in the table schema",
+                       K(ret), K(ai_result_column_names.at(k)));
+        } else if (OB_FAIL(add_ai_column_hidden_columns(*ai_result_column,
+                                                        ai_result_column_specs.at(k),
+                                                        table_schema))) {
+        }
       }
     }
 

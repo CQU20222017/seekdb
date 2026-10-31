@@ -226,6 +226,31 @@ public:
 
 public:
   int open_inner_conn();
+  // ---- AI column task rows ----
+  // The DML row loop only records the (column, rowkey predicate) pairs; the task rows are
+  // written once at the end of the statement by an extra DAS task, so that a batch DML
+  // issues a single DAS op instead of one per row and always shares the transaction of the
+  // statement (the DAS op inherits the tx of the session).
+  struct AiColumnTaskKey
+  {
+    AiColumnTaskKey() : column_id_(common::OB_INVALID_ID), predicate_() {}
+    uint64_t column_id_;
+    common::ObString predicate_;
+  };
+  int record_ai_task_upsert(const uint64_t table_id,
+                            const uint64_t column_id,
+                            const common::ObString &predicate);
+  int record_ai_task_delete(const uint64_t table_id,
+                            const uint64_t column_id,
+                            const common::ObString &predicate);
+  int record_ai_task_key(common::ObSEArray<AiColumnTaskKey, 8> &keys,
+                         const uint64_t table_id,
+                         const uint64_t column_id,
+                         const common::ObString &predicate);
+  // Write all the task rows recorded by this statement and run the DAS task. The task rows
+  // are written by the DAS insert op appended to this statement's DAS ref, so they are
+  // committed/rolled back together with the DML that produced them.
+  int flush_ai_column_tasks();
   int close_inner_conn();
   int begin_nested_session(bool skip_cur_stmt_tables);
   int end_nested_session();
@@ -279,6 +304,16 @@ protected:
   virtual ObDasParallelType check_das_parallel_type();
 
   int init_das_dml_ctx();
+  // Build the compile time / run time definition and the table location of the AI column
+  // task table. Everything is owned by this operator so that it outlives the DAS task.
+  int init_ai_task_writer();
+  // Append the task rows recorded by this statement to one DAS insert task, and the task
+  // rows that have to be removed to one DAS delete task. DAS runs the delete tasks first, so
+  // a primary key change of a row leaves exactly one task row with the new row key.
+  int append_ai_task_insert_rows();
+  int append_ai_task_delete_rows();
+  int write_ai_task_rows(ObDASInsertOp &insert_op);
+  int write_ai_task_delete_rows(ObDASDeleteOp &delete_op);
   //to merge array binding cusor info when array binding is executed in batch mode
   int merge_implict_cursor(int64_t affected_rows,
                            int64_t found_rows,
@@ -304,6 +339,38 @@ public:
   ObIInnerSQLConnection::SavedValue saved_conn_;
   bool need_foreign_key_check_;
   bool need_close_conn_;
+  // ---- AI column task rows ----
+  // The logical columns of __all_ai_column_task that this writer fills. The physical column
+  // order of the task table is resolved at runtime (see init_ai_task_writer), so the row is
+  // built through these positions instead of assuming a layout.
+  enum AiTaskColumnSlot
+  {
+    AI_TASK_SLOT_TABLE_ID = 0,
+    AI_TASK_SLOT_COLUMN_ID,
+    AI_TASK_SLOT_ROWKEY_PREDICATE,
+    AI_TASK_SLOT_ELIGIBLE_TS,
+    AI_TASK_SLOT_STATE,
+    AI_TASK_SLOT_REQUEST_ID,
+    AI_TASK_SLOT_RETRY_COUNT,
+    AI_TASK_SLOT_GMT_CREATE,
+    AI_TASK_SLOT_GMT_MODIFIED,
+    AI_TASK_SLOT_CNT
+  };
+  // AI column task rows recorded by the DML row loop, flushed at the end of the statement.
+  uint64_t ai_task_table_id_;
+  common::ObSEArray<AiColumnTaskKey, 8> ai_task_upsert_keys_;
+  common::ObSEArray<AiColumnTaskKey, 8> ai_task_delete_keys_;
+  bool ai_task_writer_inited_;
+  ObDASInsCtDef ai_task_ins_ctdef_;
+  ObDASInsRtDef ai_task_ins_rtdef_;
+  ObDASDelCtDef ai_task_del_ctdef_;
+  ObDASDelRtDef ai_task_del_rtdef_;
+  ObDASTableLoc *ai_task_table_loc_;
+  ObDASTabletLoc *ai_task_tablet_loc_;
+  // position of each logical column inside ai_task_ins_ctdef_.column_ids_
+  int64_t ai_task_col_idx_[AI_TASK_SLOT_CNT];
+  // position of each rowkey columns inside ai_task_del_ctdef_.column_ids_
+  int64_t ai_task_del_col_idx_[3];
 
   ObObjPrintParams obj_print_params_;
   bool iter_end_;

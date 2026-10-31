@@ -293,6 +293,13 @@ int assign(const ObColumnSchemaV2 &src_schema);
   inline bool is_domain_index_column() const { return is_vec_index_column() || is_fulltext_column() || is_multivalue_generated_column() || is_multivalue_generated_array_column(); }
   inline bool has_generated_column_deps() const { return column_flags_ & GENERATED_DEPS_CASCADE_FLAG; }
   inline bool is_invisible_column() const { return column_flags_ & INVISIBLE_COLUMN_FLAG; }
+  // AI COLUMN: the user visible result column, and the hidden columns generated for it.
+  inline bool is_ai_column() const { return column_flags_ & AI_COLUMN_FLAG; }
+  inline bool is_ai_state_column() const { return column_flags_ & AI_STATE_COLUMN_FLAG; }
+  inline bool is_ai_request_column() const { return column_flags_ & AI_REQUEST_COLUMN_FLAG; }
+  inline bool is_ai_result_spec_column() const { return column_flags_ & AI_RESULT_SPEC_COLUMN_FLAG; }
+  inline bool is_ai_generated_column() const
+  { return is_ai_state_column() || is_ai_request_column() || is_ai_result_spec_column(); }
   inline bool has_column_flag(int64_t flag) const { return column_flags_ & flag; }
   inline int64_t get_column_flags() const { return column_flags_; }
   //these column flags must be stored in __all_column

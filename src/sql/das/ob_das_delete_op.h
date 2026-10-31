@@ -41,6 +41,9 @@ public:
                 ObEvalCtx &eval_ctx,
                 ObChunkDatumStore::StoredRow *&stored_row);
   int64_t get_row_cnt() const { return write_buffer_.get_row_cnt(); }
+  // Access to the write buffer, so that a caller which builds its rows without expressions
+  // (e.g. the AI column task rows written by a DML operator) can fill it directly.
+  ObDASWriteBuffer &get_write_buffer() { return write_buffer_; }
   void set_das_ctdef(const ObDASDelCtDef *del_ctdef) { del_ctdef_ = del_ctdef; }
   void set_das_rtdef(ObDASDelRtDef *del_rtdef) { del_rtdef_ = del_rtdef; }
   virtual int dump_data() const override

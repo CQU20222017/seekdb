@@ -296,6 +296,26 @@ private:
                               ObDMLBaseCtDef &dml_base_ctdef,
                               common::ObIArray<ObRawExpr*> &old_row,
                               common::ObIArray<ObRawExpr*> &new_row);
+  // Collect the AI column metadata (result column ids + rowkey description) needed by the
+  // DML row loop to invalidate AI columns and to create AI column task rows.
+  int fill_ai_column_ctdef(ObLogicalOperator &op,
+                           const IndexDMLInfo &index_dml_info,
+                           ObDMLBaseCtDef &dml_base_ctdef);
+  // Reject a DML statement that assigns an AI column directly, the AI column value may only
+  // be produced by its AI function.
+  int check_ai_column_not_written(ObLogicalOperator &op,
+                                  const IndexDMLInfo &index_dml_info,
+                                  const ObTableSchema &table_schema);
+  // Dependency columns of one AI column, decoded from its spec text.
+  int get_ai_dependency_column_ids(common::ObIAllocator &alloc,
+                                   const ObTableSchema &table_schema,
+                                   const ObColumnSchemaV2 &ai_column,
+                                   ObIArray<uint64_t> &dep_column_ids);
+  // Collect the AI columns that this UPDATE statement has to invalidate (the ones whose
+  // dependency columns are assigned, or all of them when the rowkey changes).
+  int collect_ai_invalidation_column_ids(const ObDMLStmt *stmt,
+                                         const IndexDMLInfo &index_dml_info,
+                                         common::ObIArray<uint64_t> &ai_column_ids);
   int convert_normal_triggers(ObLogDelUpd &log_op,
                               const IndexDMLInfo &dml_info,
                               ObDMLBaseCtDef &dml_ctdef,

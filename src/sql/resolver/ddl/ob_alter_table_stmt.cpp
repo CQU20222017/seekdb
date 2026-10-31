@@ -30,13 +30,18 @@ namespace sql
 ObAlterTableStmt::ObAlterTableStmt(common::ObIAllocator *name_pool)
     : ObTableStmt(name_pool, stmt::T_ALTER_TABLE), is_comment_table_(false),
       is_alter_system_(false), fts_arg_allocator_(nullptr), is_alter_triggers_(false),
-      alter_table_action_count_(0)
+      alter_table_action_count_(0),
+      has_ai_column_retry_(false),
+      ai_retry_table_id_(common::OB_INVALID_ID), ai_retry_column_id_(common::OB_INVALID_ID),
+      ai_retry_column_name_()
 {
 }
 
 ObAlterTableStmt::ObAlterTableStmt()
     : ObTableStmt(stmt::T_ALTER_TABLE), is_comment_table_(false), is_alter_system_(false),
-      fts_arg_allocator_(nullptr), is_alter_triggers_(false), alter_table_action_count_(0)
+      fts_arg_allocator_(nullptr), is_alter_triggers_(false), alter_table_action_count_(0),
+      has_ai_column_retry_(false), ai_retry_table_id_(common::OB_INVALID_ID), ai_retry_column_id_(common::OB_INVALID_ID),
+      ai_retry_column_name_()
 {
 }
 

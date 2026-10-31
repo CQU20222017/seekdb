@@ -595,6 +595,261 @@ int ObDMLService::init_heap_table_pk_for_ins(const ObInsCtDef &ins_ctdef, ObEval
   return ret;
 }
 
+// ============================ AI COLUMN ============================
+
+namespace
+{
+
+// Render one rowkey value as a SQL literal.
+int render_ai_rowkey_literal(common::ObIAllocator &alloc,
+                             const ObDatum &datum,
+                             const ObObjType type,
+                             common::ObSqlString &out)
+{
+  int ret = OB_SUCCESS;
+  if (datum.is_null()) {
+    ret = out.append("NULL");
+  } else if (ob_is_integer_type(type) || ob_is_number_tc(type) || ob_is_decimal_int(type)) {
+    ret = out.append_fmt("%ld", datum.get_int());
+  } else if (ob_is_string_tc(type) || ob_is_json_tc(type)) {
+    const ObString value = datum.get_string();
+    if (OB_FAIL(out.append("'"))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+        const char c = value.ptr()[i];
+        if ('\'' == c || '\\' == c) {
+          ret = out.append_fmt("%c%c", c, c);
+        } else {
+          ret = out.append_fmt("%c", c);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ret = out.append("'");
+      }
+    }
+  } else {
+    ret = out.append_fmt("%ld", datum.get_int());
+  }
+  UNUSED(alloc);
+  return ret;
+}
+
+// Build the rowkey predicate text of one row, e.g. `id` = 2
+int build_ai_rowkey_predicate(const ObDMLBaseCtDef &ctdef,
+                              const ExprFixedArray &row,
+                              ObEvalCtx &eval_ctx,
+                              common::ObSqlString &predicate)
+{
+  int ret = OB_SUCCESS;
+  const ObString &names = ctdef.ai_rowkey_column_names_;
+  int64_t name_pos = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < ctdef.ai_rowkey_column_ids_.count(); ++i) {
+    // the rowkey column name of this position
+    int64_t name_len = 0;
+    while (name_pos + name_len < names.length() && ',' != names.ptr()[name_pos + name_len]) {
+      ++name_len;
+    }
+    ObString column_name(name_len, names.ptr() + name_pos);
+    name_pos += name_len + 1;
+    const uint64_t column_id = ctdef.ai_rowkey_column_ids_.at(i);
+    const ObObjType type = static_cast<ObObjType>(ctdef.ai_rowkey_column_types_.at(i));
+    // locate the row expression of this column
+    int64_t expr_idx = -1;
+    for (int64_t j = 0; -1 == expr_idx && j < ctdef.column_ids_.count(); ++j) {
+      if (ctdef.column_ids_.at(j) == column_id) {
+        expr_idx = j;
+      }
+    }
+    ObDatum *datum = NULL;
+    if (-1 == expr_idx) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(row.at(expr_idx))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(row.at(expr_idx)->eval(eval_ctx, datum))) {
+    } else if (NULL != datum && i > 0 && OB_FAIL(predicate.append(" and "))) {
+    } else if (OB_FAIL(predicate.append_fmt("`%.*s` = ", static_cast<int>(column_name.length()),
+                                            column_name.ptr()))) {
+    } else if (OB_FAIL(render_ai_rowkey_literal(eval_ctx.get_expr_res_alloc(), *datum, type,
+                                                predicate))) {
+    }
+  }
+  return ret;
+}
+
+// Write the AI column task rows of one inserted row: one row per AI column of the table.
+int insert_ai_column_task_rows(const ObDMLBaseCtDef &ctdef,
+                               const ExprFixedArray &row,
+                               ObTableModifyOp &dml_op)
+{
+  int ret = OB_SUCCESS;
+  ObEvalCtx &eval_ctx = dml_op.get_eval_ctx();
+  ObSqlString predicate;
+  if (OB_UNLIKELY(ctdef.ai_column_ids_.empty())) {
+    // short circuit: the table has no AI column
+  } else if (OB_FAIL(build_ai_rowkey_predicate(ctdef, row, eval_ctx, predicate))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < ctdef.ai_column_ids_.count(); ++i) {
+      if (OB_FAIL(dml_op.record_ai_task_upsert(ctdef.das_base_ctdef_.index_tid_,
+                                               ctdef.ai_column_ids_.at(i),
+                                               predicate.string()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+// Position of `column_id` inside the DML row. old_row_ and new_row_ are aligned with
+// ObDMLBaseCtDef::column_ids_.
+int find_ai_row_column_index(const ObDMLBaseCtDef &ctdef, const uint64_t column_id, int64_t &idx)
+{
+  int ret = OB_SUCCESS;
+  idx = -1;
+  for (int64_t i = 0; -1 == idx && i < ctdef.column_ids_.count(); ++i) {
+    if (ctdef.column_ids_.at(i) == column_id) {
+      idx = i;
+    }
+  }
+  return ret;
+}
+
+// Whether the value of `column_id` differs between the old and the new row of this statement.
+int ai_column_value_changed(const ObDMLBaseCtDef &ctdef,
+                            const uint64_t column_id,
+                            ObEvalCtx &eval_ctx,
+                            bool &changed)
+{
+  int ret = OB_SUCCESS;
+  int64_t idx = -1;
+  ObDatum *old_datum = NULL;
+  ObDatum *new_datum = NULL;
+  changed = false;
+  if (OB_FAIL(find_ai_row_column_index(ctdef, column_id, idx))) {
+  } else if (-1 == idx) {
+    // the column is not part of this DML row, so the statement can not change it
+  } else if (OB_ISNULL(ctdef.old_row_.at(idx)) || OB_ISNULL(ctdef.new_row_.at(idx))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the column expression of the dml row is null", KR(ret), K(idx));
+  } else if (OB_FAIL(ctdef.old_row_.at(idx)->eval(eval_ctx, old_datum))
+             || OB_FAIL(ctdef.new_row_.at(idx)->eval(eval_ctx, new_datum))) {
+  } else if (is_lob_storage(ctdef.old_row_.at(idx)->datum_meta_.type_)
+             && is_lob_storage(ctdef.new_row_.at(idx)->datum_meta_.type_)) {
+    int64_t cmp_res = 0;
+    if (OB_FAIL(ObDMLService::check_lob_column_changed(eval_ctx,
+                                                       *ctdef.old_row_.at(idx), *old_datum,
+                                                       *ctdef.new_row_.at(idx), *new_datum,
+                                                       cmp_res))) {
+    } else {
+      changed = (0 != cmp_res);
+    }
+  } else {
+    changed = !ObDatum::binary_equal(*old_datum, *new_datum);
+  }
+  return ret;
+}
+
+// Invalidate the AI columns of one updated row: the value of every AI column that this
+// statement has to invalidate is reset to NULL on the row being written (so the change is
+// visible inside the transaction and undone by a rollback), and its work item is scheduled.
+int record_ai_column_tasks_for_update(const ObUpdCtDef &upd_ctdef, ObTableModifyOp &dml_op)
+{
+  int ret = OB_SUCCESS;
+  ObEvalCtx &eval_ctx = dml_op.get_eval_ctx();
+  const int64_t ai_cnt = upd_ctdef.ai_column_ids_.count();
+  const uint64_t table_id = upd_ctdef.das_base_ctdef_.index_tid_;
+  ObSqlString new_predicate;
+  ObSqlString old_predicate;
+  bool rowkey_changed = false;
+  if (0 == ai_cnt) {
+    // this statement does not invalidate any AI column of the table
+  }
+  // a rowkey change moves the work item of this row to the new row key
+  for (int64_t i = 0; OB_SUCC(ret) && !rowkey_changed
+                      && i < upd_ctdef.ai_rowkey_column_ids_.count(); ++i) {
+    bool changed = false;
+    if (OB_FAIL(ai_column_value_changed(upd_ctdef,
+                                        upd_ctdef.ai_rowkey_column_ids_.at(i),
+                                        eval_ctx,
+                                        changed))) {
+    } else {
+      rowkey_changed = changed;
+    }
+  }
+  if (OB_SUCC(ret) && ai_cnt > 0
+      && OB_FAIL(build_ai_rowkey_predicate(upd_ctdef, upd_ctdef.new_row_,
+                                           eval_ctx, new_predicate))) {
+  }
+  if (OB_SUCC(ret) && rowkey_changed
+      && OB_FAIL(build_ai_rowkey_predicate(upd_ctdef, upd_ctdef.old_row_,
+                                           eval_ctx, old_predicate))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_cnt; ++i) {
+    int64_t idx = -1;
+    ObExpr *ai_expr = NULL;
+    if (OB_FAIL(find_ai_row_column_index(upd_ctdef, upd_ctdef.ai_column_ids_.at(i), idx))) {
+    } else if (-1 == idx || OB_ISNULL(ai_expr = upd_ctdef.new_row_.at(idx))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the AI column is not part of the update row", KR(ret), K(idx));
+    } else {
+      // 1. reset the result column of the row this statement writes
+      ObDatum &datum = ai_expr->locate_datum_for_write(eval_ctx);
+      datum.set_null();
+      ai_expr->get_eval_info(eval_ctx).evaluated_ = true;
+      // 2. schedule the work item of the new row key. A work item of this key may already be
+      // pending (e.g. produced by the INSERT of the row), so the old one is removed first: DAS
+      // runs the delete task of a statement before its insert task.
+      if (OB_FAIL(dml_op.record_ai_task_delete(table_id,
+                                               upd_ctdef.ai_column_ids_.at(i),
+                                               new_predicate.string()))) {
+      } else if (OB_FAIL(dml_op.record_ai_task_upsert(table_id,
+                                                      upd_ctdef.ai_column_ids_.at(i),
+                                                      new_predicate.string()))) {
+      } else if (rowkey_changed
+                 && OB_FAIL(dml_op.record_ai_task_delete(table_id,
+                                                         upd_ctdef.ai_column_ids_.at(i),
+                                                         old_predicate.string()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+// Drop the pending AI column work items of a deleted row, one per AI column of the table.
+int delete_ai_column_tasks(const ObDelCtDef &del_ctdef, ObTableModifyOp &dml_op)
+{
+  int ret = OB_SUCCESS;
+  ObEvalCtx &eval_ctx = dml_op.get_eval_ctx();
+  ObSqlString predicate;
+  if (del_ctdef.ai_column_ids_.empty()) {
+    // the table has no AI column
+  } else if (OB_FAIL(build_ai_rowkey_predicate(del_ctdef, del_ctdef.old_row_,
+                                               eval_ctx, predicate))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < del_ctdef.ai_column_ids_.count(); ++i) {
+      if (OB_FAIL(dml_op.record_ai_task_delete(del_ctdef.das_base_ctdef_.index_tid_,
+                                               del_ctdef.ai_column_ids_.at(i),
+                                               predicate.string()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+// Whether this DML statement runs on the AI column worker's own session. The worker publishes
+// a model result with an internal UPDATE on the user table; the AI column hooks must be
+// disabled there, otherwise every published value would invalidate the column again and
+// schedule the very work item that was just finished.
+bool is_ai_column_worker_op(ObTableModifyOp &dml_op)
+{
+  bool bret = false;
+  ObSQLSessionInfo *session = dml_op.get_exec_ctx().get_my_session();
+  if (OB_NOT_NULL(session)) {
+    bret = session->is_ai_column_worker();
+  }
+  return bret;
+}
+
+} // anonymous namespace
+
 int ObDMLService::process_insert_row(const ObInsCtDef &ins_ctdef,
                                      ObInsRtDef &ins_rtdef,
                                      ObTableModifyOp &dml_op,
@@ -629,6 +884,10 @@ int ObDMLService::process_insert_row(const ObInsCtDef &ins_ctdef,
                                       ins_ctdef.is_single_value_,
                                       dml_op))) {
     } else if (OB_FAIL(check_filter_row(ins_ctdef, dml_op.get_eval_ctx(), is_skipped))) {
+    } else if (!is_skipped && !is_ai_column_worker_op(dml_op)
+               && OB_FAIL(insert_ai_column_task_rows(ins_ctdef,
+                                                     ins_ctdef.new_row_,
+                                                     dml_op))) {
     }
 
   }
@@ -730,6 +989,9 @@ int ObDMLService::process_delete_row(const ObDelCtDef &del_ctdef,
           dml_op, del_ctdef.das_base_ctdef_, del_ctdef.trig_ctdef_, del_rtdef.trig_rtdef_))) {
       }
     }
+    if (OB_SUCC(ret) && !is_skipped && !is_ai_column_worker_op(dml_op)
+        && OB_FAIL(delete_ai_column_tasks(del_ctdef, dml_op))) {
+    }
     LOG_DEBUG("process delete row", K(ret), K(is_skipped),
                "old_row", ROWEXPR2STR(dml_op.get_eval_ctx(), del_ctdef.old_row_));
   }
@@ -825,6 +1087,15 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
   if (OB_FAIL(ret)) {
   } else if (!is_skipped && upd_rtdef.has_table_cycle_) {
     ret = OB_ERR_ROW_IS_REFERENCED;
+  }
+
+  if (OB_SUCC(ret)) {
+    // Schedule the AI column work items of this row: the result column itself has already been
+    // reset to NULL by the compile phase of the statement.
+    if (!is_skipped && upd_ctdef.is_primary_index_ && upd_rtdef.is_row_changed_
+        && !is_ai_column_worker_op(dml_op)
+        && OB_FAIL(record_ai_column_tasks_for_update(upd_ctdef, dml_op))) {
+    }
   }
 
   if (OB_SUCC(ret) && !is_skipped) {

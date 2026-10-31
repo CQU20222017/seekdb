@@ -278,7 +278,7 @@ seekdb_test_interface(
             sql_runtime_without_pass_test_oblib_deps()
         )
     }.keys()),
-    visibility = ["//unittest/sql:__pkg__"],
+    visibility = ["//unittest/sql:__subpackages__"],
 )
 
 _SQL_STANDALONE_SANITY_PARTITION = sql_partition_sources(

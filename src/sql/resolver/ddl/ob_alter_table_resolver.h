@@ -67,6 +67,9 @@ public:
   int resolve_convert_to_character(const ParseNode &node);
   int resolve_foreign_key_options(const ParseNode &node);
   int resolve_add_column(const ParseNode &node, ObColumnNameSet &resolve_add_column);
+  // Generate the three hidden columns of an AI column at ALTER TABLE ADD COLUMN time.
+  int add_ai_column_hidden_columns(const share::schema::AlterColumnSchema &result_column,
+                                   const common::ObString &spec_text);
   int resolve_alter_column(const ParseNode &node);
   int resolve_change_column(const ParseNode &node);
   int check_modify_column_allowed(const share::schema::AlterColumnSchema &alter_column_schema,
@@ -99,6 +102,10 @@ private:
       share::schema::ObSchemaGetterGuard *schema_guard,
       const obcall::ObCreateForeignKeyArg &foreign_key_arg);
   int resolve_alter_table_option_list(const ParseNode &node);
+  // ALTER TABLE <t> RETRY AI COLUMN <col> [WHERE <pred>] (control action, not a schema change).
+  int resolve_ai_column_retry(ObAlterTableStmt *alter_table_stmt,
+                              const ParseNode &node,
+                              const uint64_t action_count);
   int check_drop_column_is_partition_key(const ObTableSchema &table_schema, 
                                          const ObString &column_name);
 

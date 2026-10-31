@@ -411,6 +411,14 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
             }
             break;
           }
+        case T_AI_COLUMN_RETRY: {
+            // RETRY AI COLUMN is a control action: it must be the only action of the statement
+            // and it targets exactly one AI column.
+            if (OB_FAIL(resolve_ai_column_retry(alter_table_stmt, *action_node,
+                                       static_cast<uint64_t>(node.num_child_)))) {
+            }
+            break;
+          }
         case T_TABLE_OPTION_LIST: {
             alter_table_stmt->set_alter_table_option();
             if (OB_FAIL(resolve_alter_table_option_list(*action_node))) {
@@ -3346,6 +3354,45 @@ int ObAlterTableResolver::resolve_foreign_key_options(const ParseNode &node)
   return ret;
 }
 
+// `ALTER TABLE <t> RETRY AI COLUMN <col> [WHERE <pred>]` is a control action: it does not
+// change the schema, it only re-schedules AI column work for the rows matched by the
+// predicate. Only the syntax, the target column and the "must be alone" rule are resolved
+// here; the execution path is not implemented yet.
+int ObAlterTableResolver::resolve_ai_column_retry(ObAlterTableStmt *alter_table_stmt,
+                                                 const ParseNode &node,
+                                                 const uint64_t action_count)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *name_node = (2 == node.num_child_ && OB_NOT_NULL(node.children_))
+                                   ? node.children_[0] : NULL;
+  if (OB_ISNULL(name_node) || OB_ISNULL(table_schema_) || OB_ISNULL(alter_table_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid parse tree of a retry ai column action", KR(ret),
+                 KP(name_node), KP(table_schema_));
+  } else if (1 != action_count) {
+    // mixing RETRY with another ALTER action is not allowed
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+  } else {
+    const common::ObString column_name(name_node->str_len_, name_node->str_value_);
+    const ObColumnSchemaV2 *column = table_schema_->get_column_schema(column_name);
+    if (OB_ISNULL(column) || !column->is_ai_column()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    } else if (OB_FAIL(alter_table_stmt->set_origin_table_name(
+                           table_schema_->get_table_name_str()))) {
+    } else if (FALSE_IT(alter_table_stmt->set_ai_column_retry(
+                            table_schema_->get_table_id(), column->get_column_id(),
+                            column->get_column_name_str(),
+                            common::ObString(node.str_len_, node.str_value_)))) {
+    } else {
+      SQL_RESV_LOG(INFO, "retry ai column action resolved", K(column_name),
+                   K(column->get_column_id()));
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableResolver::resolve_alter_table_option_list(const ParseNode &node)
 {
   int ret = OB_SUCCESS;
@@ -3455,13 +3502,48 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
 
         //add column
         if (OB_SUCC(ret)) {
-          if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
+          // An AI column also generates three hidden columns. The spec of the AI column is
+          // carried by the comment of its result-spec hidden column.
+          bool is_ai_column = ObDDLResolver::is_ai_column_node(node.children_[i]);
+          ObString ai_column_spec_text;
+          if (is_ai_column
+              && OB_FAIL(resolve_ai_column_spec(node.children_[i],
+                                                alter_column_schema,
+                                                alter_table_stmt->get_alter_table_schema(),
+                                                ai_column_spec_text))) {
+          } else if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          } else if (is_ai_column
+                     && OB_FAIL(add_ai_column_hidden_columns(alter_column_schema, ai_column_spec_text))) {
           }
         }
       }
     }
     add_column_cnt_++;
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::add_ai_column_hidden_columns(
+    const AlterColumnSchema &result_column,
+    const ObString &spec_text)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  const int64_t kinds[] = {AI_STATE_COLUMN_FLAG,
+                           AI_REQUEST_COLUMN_FLAG,
+                           AI_RESULT_SPEC_COLUMN_FLAG};
+  if (OB_ISNULL(alter_table_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(kinds); ++i) {
+    AlterColumnSchema hidden_column;
+    if (OB_FAIL(build_ai_hidden_column(result_column, spec_text, kinds[i], hidden_column))) {
+    } else if (OB_FAIL(hidden_column.set_origin_column_name(hidden_column.get_column_name_str()))) {
+    } else if (FALSE_IT(hidden_column.alter_type_ = OB_DDL_ADD_COLUMN)) {
+    } else if (OB_FAIL(alter_table_stmt->add_column(hidden_column))) {
+      SQL_RESV_LOG(WARN, "fail to add AI hidden column", K(ret), K(hidden_column));
+    }
   }
   return ret;
 }

@@ -106,6 +106,12 @@ static const uint64_t OB_MIN_ID  = 0;//used for lower_bound
 #define RESERVED_COLUMN_FLAG_4 (INT64_C(1) << 4)
 #define RESERVED_COLUMN_FLAG_5 (INT64_C(1) << 5)
 #define INVISIBLE_COLUMN_FLAG (INT64_C(1) << 6)
+// AI COLUMN flags. An AI column is a user visible result column (AI_COLUMN_FLAG)
+// plus three generated hidden columns that carry its runtime state.
+#define AI_COLUMN_FLAG (INT64_C(1) << 7)
+#define AI_STATE_COLUMN_FLAG (INT64_C(1) << 9)
+#define AI_REQUEST_COLUMN_FLAG (INT64_C(1) << 10)
+#define AI_RESULT_SPEC_COLUMN_FLAG (INT64_C(1) << 11)
 // The logic of the new table without a primary key changes the column (partition key) to the primary key
 #define HEAP_ALTER_ROWKEY_FLAG (INT64_C(1) << 8)
 #define HEAP_TABLE_SORT_ROWKEY_FLAG (INT64_C(1) << 12) // 1:sortkey in new no pk table

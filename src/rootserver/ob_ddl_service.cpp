@@ -8589,6 +8589,27 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
     }
 
     bool is_add_lob = false;
+    // Persist the metadata of the AI columns added by this statement. It is done after the
+    // column loop so that all three generated hidden columns are already in the schema.
+    if (OB_SUCC(ret)) {
+      for (ObTableSchema::const_column_iterator it = alter_table_schema.column_begin();
+           OB_SUCC(ret) && it != alter_table_schema.column_end(); ++it) {
+        const ObColumnSchemaV2 *alter_column = *it;
+        const ObColumnSchemaV2 *ai_column = NULL;
+        if (OB_ISNULL(alter_column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (!alter_column->is_ai_column()
+                   || (static_cast<const AlterColumnSchema *>(alter_column))->alter_type_
+                        != OB_DDL_ADD_COLUMN) {
+          // not an AI column added by this statement
+        } else if (OB_ISNULL(ai_column = new_table_schema.get_column_schema(
+                                 alter_column->get_column_name_str()))) {
+          ret = OB_ERR_UNEXPECTED;
+          RS_LOG(WARN, "AI column is missing in the new table schema", KR(ret), K(*alter_column));
+        } else if (OB_FAIL(ddl_operator.insert_ai_column(trans, new_table_schema, *ai_column))) {
+        }
+      }
+    }
     if(OB_FAIL(ret)) {
     } else if (OB_FAIL(blocksstable::check_skip_index_valid(new_table_schema))) {
     } else if (OB_FAIL(new_table_schema.check_row_length())) {

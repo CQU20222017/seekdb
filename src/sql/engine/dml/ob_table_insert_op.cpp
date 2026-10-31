@@ -282,6 +282,9 @@ int ObTableInsertOp::write_rows_post_proc(int last_errno)
       if (OB_FAIL(check_insert_affected_row())) {
       }
     }
+    // Write the AI column task rows collected by the row loop of this statement.
+    if (OB_SUCC(ret) && OB_FAIL(flush_ai_column_tasks())) {
+    }
   }
   return ret;
 }

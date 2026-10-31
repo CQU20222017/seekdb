@@ -447,6 +447,23 @@ private:
   int add_single_column(common::ObISQLClient &sql_client, const ObColumnSchemaV2 &column,
                         const bool only_history = false);
 
+  // ---- AI COLUMN metadata (__all_ai_column) ----
+public:
+  // Write one __all_ai_column row for `result_column`, which must be an AI column of
+  // `table`. The three generated hidden columns and the spec of the AI column are looked
+  // up from `table`.
+  int add_ai_column(ObISQLClient &sql_client,
+                    const ObTableSchema &table,
+                    const ObColumnSchemaV2 &result_column);
+  int batch_add_ai_columns_for_create_table(common::ObISQLClient &sql_client,
+                                            const ObIArray<ObTableSchema> &tables);
+  int delete_from_all_ai_column(ObISQLClient &sql_client, const uint64_t table_id);
+  int delete_from_all_ai_column_task(ObISQLClient &sql_client, const uint64_t table_id);
+  int delete_single_ai_column(ObISQLClient &sql_client,
+                              const uint64_t table_id,
+                              const uint64_t column_id);
+
+private:
   int delete_from_all_column_usage(ObISQLClient &sql_client,
                                    const uint64_t table_id);
   int delete_from_all_monitor_modified(ObISQLClient &sql_client,

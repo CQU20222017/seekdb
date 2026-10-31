@@ -628,6 +628,7 @@ ObServer::ObServer()
     ctas_clean_up_timer_(),
     duty_task_(),
     sql_mem_task_(),
+    ai_column_worker_(),
     ctas_clean_up_task_(),
     refresh_cpu_frequency_task_(),
     schema_status_proxy_(sql_proxy_),
@@ -1609,6 +1610,12 @@ int ObServer::stop()
     sql_mem_timer_.stop();
     FLOG_INFO("sql memory manager timer stopped");
 
+    // let the current AI column publish transaction finish before the inner sql proxy goes away
+    FLOG_INFO("begin to stop the ai column worker");
+    ai_column_worker_.stop();
+    ai_column_worker_.wait();
+    FLOG_INFO("ai column worker stopped");
+
     FLOG_INFO("begin to stop ctas clean up timer");
     ctas_clean_up_timer_.stop();
     FLOG_INFO("ctas clean up timer stopped");
@@ -2191,6 +2198,13 @@ int ObServer::init_server_runtime()
   if (OB_SUCC(ret)) {
     if (OB_FAIL(duty_task_.schedule(server_gtimer_))) {
     } else if (OB_FAIL(sql_mem_task_.schedule(sql_mem_timer_))) {
+    }
+  }
+
+  // The AI column worker publishes the pending AI column work items in its own thread.
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(ai_column_worker_.start())) {
+      LOG_WARN("fail to start the ai column worker", KR(ret));
     }
   }
 

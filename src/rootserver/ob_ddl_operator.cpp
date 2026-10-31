@@ -1277,6 +1277,20 @@ int ObDDLOperator::insert_single_column(ObMySQLTransaction &trans,
   return ret;
 }
 
+int ObDDLOperator::insert_ai_column(ObMySQLTransaction &trans,
+                                    const ObTableSchema &table_schema,
+                                    const ObColumnSchemaV2 &result_column)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaService *schema_service = schema_service_.get_schema_service();
+  if (OB_ISNULL(schema_service)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_service->get_table_sql_service().add_ai_column(
+                       trans, table_schema, result_column))) {
+  }
+  return ret;
+}
+
 int ObDDLOperator::delete_single_column(ObMySQLTransaction &trans,
                                         const int64_t new_schema_version,
                                         ObTableSchema &new_table_schema,

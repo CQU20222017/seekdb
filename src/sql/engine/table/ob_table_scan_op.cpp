@@ -30,6 +30,8 @@
 #include "sql/das/iter/ob_das_iter_utils.h"
 #include "sql/engine/px/ob_granule_iterator_op.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "share/ai_service/ob_ai_column_schema.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
 
 namespace oceanbase
 {
@@ -43,6 +45,124 @@ namespace sql
 
 namespace
 {
+// ai_column_strict_read (M4): a statement that touches an AI column is rejected while that
+// (table, column) still has unfinished AI column work items, no matter which rows the
+// statement selects. The judgement is column wide, not row wide.
+//
+// The check runs internal SQL, so it must never run for an internal session (that would
+// recurse into the check itself), and it must be a no-op unless the session variable is on.
+thread_local bool in_ai_strict_read_check = false;
+
+// Run one existence probe on an internal connection.
+int has_row(ObExecContext &ctx, const common::ObSqlString &sql, bool &found)
+{
+  int ret = OB_SUCCESS;
+  found = false;
+  common::ObISQLClient *sql_proxy = ctx.get_sql_proxy();
+  common::ObISQLClient::ReadResult res;
+  if (OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the sql proxy is null", KR(ret));
+  } else if (OB_FAIL(sql_proxy->read(res, sql.ptr()))) {
+    LOG_WARN("fail to run the AI column strict read check", KR(ret), K(sql));
+  } else if (OB_ISNULL(res.get_result())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the check result is null", KR(ret));
+  } else {
+    const int tmp_ret = res.get_result()->next();
+    if (OB_SUCCESS == tmp_ret) {
+      found = true;
+    } else if (OB_ITER_END != tmp_ret) {
+      ret = tmp_ret;
+      LOG_WARN("fail to read the AI column strict read check result", KR(ret), K(sql));
+    }
+  }
+  const int close_ret = res.close();
+  if (OB_SUCCESS != close_ret && OB_SUCCESS == ret) {
+    ret = close_ret;
+  }
+  return ret;
+}
+
+int check_one_ai_column(ObExecContext &ctx, const share::schema::ObTableSchema &table_schema,
+                        const share::schema::ObColumnSchemaV2 &ai_column,
+                        const share::schema::ObDatabaseSchema *db_schema)
+{
+  int ret = OB_SUCCESS;
+  common::ObISQLClient *sql_proxy = ctx.get_sql_proxy();
+  const uint64_t table_id = table_schema.get_table_id();
+  const uint64_t column_id = ai_column.get_column_id();
+  ObArenaAllocator allocator("AiStrictRead");
+  ObSqlString sql;
+  ObString state_column;
+  bool unfinished = false;
+  if (OB_ISNULL(sql_proxy) || OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument to check an AI column", KR(ret), KP(sql_proxy), KP(db_schema));
+  } else if (OB_FAIL(share::build_ai_hidden_column_name(allocator,
+                                                        share::AI_STATE_COLUMN_PREFIX,
+                                                        ai_column.get_column_name_str(),
+                                                        state_column))) {
+  } else if (OB_FAIL(sql.assign_fmt(
+                 "select 1 from %.*s.%s where %.*s is null or %.*s <> 'READY' limit 1",
+                 db_schema->get_database_name_str().length(),
+                 db_schema->get_database_name_str().ptr(),
+                 table_schema.get_table_name_str().ptr(),
+                 state_column.length(), state_column.ptr(),
+                 state_column.length(), state_column.ptr()))) {
+  } else if (OB_FAIL(has_row(ctx, sql, unfinished))) {
+  } else if (!unfinished && OB_FAIL(sql.assign_fmt(
+                 "select 1 from oceanbase.__all_ai_column_task "
+                 "where table_id = %lu and column_id = %lu and state in (0, 3) limit 1",
+                 table_id, column_id))) {
+  } else if (!unfinished && OB_FAIL(has_row(ctx, sql, unfinished))) {
+  }
+  if (OB_SUCC(ret) && unfinished) {
+    ret = OB_ERR_AI_COLUMN_UNFINISHED_TASK;
+    LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED_TASK, table_id, column_id);
+    LOG_WARN("the AI column still has unfinished tasks", K(table_id), K(column_id),
+             K(ai_column.get_column_name_str()));
+  }
+  return ret;
+}
+
+int check_ai_column_strict_read(ObExecContext &ctx, const uint64_t table_id,
+                                const common::ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = GET_MY_SESSION(ctx);
+  ObSchemaGetterGuard *schema_guard = ctx.get_virtual_table_ctx().schema_guard_;
+  const ObTableSchema *table_schema = NULL;
+  const ObDatabaseSchema *db_schema = NULL;
+  bool strict_read = false;
+  if (OB_ISNULL(session) || OB_ISNULL(schema_guard) || OB_INVALID_ID == table_id) {
+    // nothing to check
+  } else if (session->is_inner() || session->is_ai_column_worker() || in_ai_strict_read_check) {
+    // an internal statement: never reject it and never recurse into this check
+  } else if (OB_FAIL(session->get_sys_variable(SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+    LOG_WARN("fail to read ai_column_strict_read", KR(ret));
+  } else if (!strict_read) {
+    // the feature is off by default: no extra work at all for ordinary queries
+  } else if (OB_FAIL(schema_guard->get_table_schema(table_id, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_guard->get_database_schema(table_schema->get_database_id(), db_schema))) {
+  } else if (OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    in_ai_strict_read_check = true;
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_ids.count(); ++i) {
+      const ObColumnSchemaV2 *column = table_schema->get_column_schema(column_ids.at(i));
+      if (NULL != column && column->is_ai_column()) {
+        if (OB_FAIL(check_one_ai_column(ctx, *table_schema, *column, db_schema))) {
+        }
+      }
+    }
+    in_ai_strict_read_check = false;
+  }
+  return ret;
+}
+
 // Recursively find ObDASVecAuxScanCtDef with skip_delta_buffer_ in the attach hierarchy.
 // Used for HNSW+async: when index lookup finds deleted row, skip it instead of 4377.
 bool find_skip_delta_buffer_in_ctdef(const ObDASBaseCtDef *ctdef)
@@ -1435,6 +1555,8 @@ int ObTableScanOp::inner_open()
   init_scan_monitor_info();
   if (OB_ISNULL(my_session = GET_MY_SESSION(ctx_))) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(check_ai_column_strict_read(ctx_, MY_SPEC.ref_table_id_,
+                                                 MY_CTDEF.get_full_acccess_cids()))) {
   } else if (OB_FAIL(ObDASUtils::check_nested_sql_mutating(MY_SPEC.ref_table_id_, ctx_, true))) {
   } else if (OB_FAIL(init_table_scan_rtdef())) {
   } else if (MY_SPEC.is_fts_ddl_ && OB_FAIL(fts_index_.init(MY_SPEC.is_fts_index_aux_, MY_SPEC.parser_name_,

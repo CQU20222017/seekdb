@@ -438,6 +438,15 @@ public:
   bool reserved_advanced_trigger_;
   ObExpr *trans_info_expr_;
   bool is_vec_hnsw_index_vid_opt_;
+  // ---- AI COLUMN ----
+  // Ids of the AI result columns of the modified table that this statement has to invalidate.
+  // Empty for tables without AI columns (and for an UPDATE that does not touch a dependency
+  // column), in which case the DML row loop has no extra work to do at all.
+  UIntFixedArray ai_column_ids_;
+  // Rowkey of the modified table, used to build the task row's rowkey predicate.
+  UIntFixedArray ai_rowkey_column_ids_;
+  UIntFixedArray ai_rowkey_column_types_;
+  common::ObString ai_rowkey_column_names_; // comma separated rowkey column names
 protected:
   ObDMLBaseCtDef(common::ObIAllocator &alloc,
                  ObDASDMLBaseCtDef &das_base_ctdef,
@@ -456,7 +465,11 @@ protected:
       is_table_without_pk_(false),
       reserved_advanced_trigger_(false),
       trans_info_expr_(nullptr),
-      is_vec_hnsw_index_vid_opt_(false)
+      is_vec_hnsw_index_vid_opt_(false),
+      ai_column_ids_(alloc),
+      ai_rowkey_column_ids_(alloc),
+      ai_rowkey_column_types_(alloc),
+      ai_rowkey_column_names_()
   { }
 };
 

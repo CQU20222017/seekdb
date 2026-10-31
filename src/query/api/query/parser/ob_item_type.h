@@ -1086,6 +1086,11 @@ typedef enum ObItemType
   T_IF_NOT_EXISTS = 3382,
   T_IF_EXISTS = 3383,
   T_JOIN_INFO = 3384,
+  // Payload of an "AI COLUMN" column definition: children are
+  // [0] the AI function call expression, [1] the optional WITH(...) option list.
+  T_AI_COLUMN_DEFINITION = 3385,
+  // One "key = value" pair of the AI COLUMN WITH(...) option list.
+  T_AI_COLUMN_OPTION = 3388,
   T_TABLET_MAX_SIZE = 3386,
   T_BLOCK_SIZE = 3387,
   T_TABLET_ID = 3391,
@@ -2275,6 +2280,9 @@ typedef enum ObItemType
   T_DIFF_TABLE = 4918,
   T_MERGE_TABLE = 4919,
   T_FLUSH_PRIVILEGES = 4920,
+  // One ALTER TABLE <t> RETRY AI COLUMN <col> [WHERE <pred>] action: children are [0] the
+  // column name, [1] the optional WHERE predicate.
+  T_AI_COLUMN_RETRY = 4921,
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

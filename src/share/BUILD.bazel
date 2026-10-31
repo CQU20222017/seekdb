@@ -534,6 +534,7 @@ seekdb_semantic_unity_cc_library(
         ":cluster_version_interface",
         ":error_codes",
         ":io",
+        ":local_storage_interface",
         ":resource_limit_interface",
         ":sql_persistence_support",
         ":task_control",

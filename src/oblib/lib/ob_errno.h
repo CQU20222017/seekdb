@@ -389,6 +389,8 @@ constexpr int OB_TMP_FILE_EXCEED_DISK_QUOTA = -9135;
 constexpr int OB_ERR_DUPLICATE_INDEX = -9137;
 constexpr int OB_DAG_TASK_IS_SUSPENDED = -9143;
 constexpr int OB_ERR_XML_PARSE = -9549;
+// Strict read of an AI column: the (table, column) still has unfinished AI column work items.
+constexpr int OB_ERR_AI_COLUMN_UNFINISHED_TASK = -11120;
 } // common
 using namespace common; // maybe someone can fix
 } // oceanbase

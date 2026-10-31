@@ -10975,5 +10975,20 @@
     "info_cn": "",
     "background_cn": "",
     "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10754,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "whether a query on an AI column fails when the column still has unfinished AI column work items",
+    "flags": "GLOBAL | SESSION",
+    "min_val": "0",
+    "max_val": "1",
+    "publish_version": "",
+    "info_cn": "开启后，引用 AI 列的查询在该列仍有未完成的 AI 任务时直接报错",
+    "background_cn": "",
+    "ref_url": ""
   }
 }

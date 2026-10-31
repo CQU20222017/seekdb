@@ -244,7 +244,7 @@ END_P SET_VAR DELIMITER
         ON OPTIMIZE /*OPTIMIZER_COSTS*/ OPTION OPTIONALLY OR ORDER OUT OUTER OUTFILE
         PARTITION PRECISION PRIMARY PROCEDURE PURGE
         RANGE READ READS READ_WRITE REAL REFERENCES REGEXP RELEASE RENAME REPEAT REPLACE REQUIRE
-        RESIGNAL RESTRICT RETURN REVOKE RIGHT RLIKE
+        RESIGNAL RESTRICT RETRY RETURN REVOKE RIGHT RLIKE
         SCHEMA SCHEMAS SECOND_MICROSECOND SELECT SENSITIVE SEPARATOR SET SHOW SIGNAL SMALLINT SPATIAL
         SPECIFIC SQL SQLEXCEPTION SQLSTATE SQLWARNING SQL_BIG_RESULT SQL_CALC_FOUND_ROWS
         SQL_SMALL_RESULT SSL SKIP STARTING STORED STRAIGHT_JOIN
@@ -395,6 +395,7 @@ END_P SET_VAR DELIMITER
 %type <node> update_basic_stmt delete_basic_stmt
 %type <node> table_element_list table_element column_definition column_definition_ref column_definition_list column_name_list
 %type <node> opt_generated_keyname opt_generated_option_list opt_generated_column_attribute_list generated_column_attribute opt_storage_type
+%type <node> opt_ai_column_option_list ai_column_option_list ai_column_option ai_column_option_value
 %type <node> data_type special_table_type opt_if_not_exists opt_if_exists opt_charset collation opt_collation cast_data_type
 %type <node> replace_with_opt_hint insert_with_opt_hint column_list opt_on_duplicate_key_clause opt_into opt_replace opt_temporary no_param_column_ref
 %type <node> insert_vals_list insert_vals value_or_values opt_insert_row_alias
@@ -4849,6 +4850,21 @@ column_definition_ref data_type opt_column_attribute_list opt_column_reference o
   merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, $10);
   malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 7, $1, $2, attributes, $7, $9, $12, $4);
 }
+| column_definition_ref data_type AI COLUMN '(' expr ')' opt_ai_column_option_list opt_column_attribute_list opt_column_reference opt_position_column
+{
+  /* AI COLUMN: reuse the generated-column 7-child layout of T_COLUMN_DEFINITION so that
+   * every existing T_COLUMN_DEFINITION consumer keeps working unchanged. The 7th child,
+   * which holds opt_generated_keyname for generated columns, carries the AI payload here. */
+  (void)($10);
+  ParseNode *attributes = NULL;
+  ParseNode *ai_column_node = NULL;
+  set_data_type_collation($2, attributes, false, true);
+  dup_expr_string($6, result, @6.first_column, @6.last_column);
+  merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, $9);
+  malloc_non_terminal_node(ai_column_node, result->malloc_pool_, T_AI_COLUMN_DEFINITION, 2, $6, $8);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 7,
+                           $1, $2, attributes, NULL, NULL, $11, ai_column_node);
+}
 | column_definition_ref SERIAL opt_column_attribute_list opt_position_column 
 {
   ParseNode *unsigned_bigint_type = NULL;
@@ -4925,6 +4941,60 @@ opt_generated_option_list:
 ALWAYS
 {
   malloc_terminal_node($$, result->malloc_pool_, T_CONSTR_ALWAYS);
+}
+;
+
+/* AI COLUMN (...) WITH (key = value, ...) */
+opt_ai_column_option_list:
+WITH '(' ai_column_option_list ')'
+{
+  $$ = $3;
+}
+| /*empty*/
+{
+  $$ = NULL;
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, NULL, $1);
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+relation_name COMP_EQ ai_column_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 2, $1, $3);
+}
+;
+
+ai_column_option_value:
+INTNUM
+{
+  $1->type_ = T_NUMBER;
+  $$ = $1;
+}
+| BOOL_VALUE
+{
+  $$ = $1;
+}
+| DECIMAL_VAL
+{
+  $$ = $1;
+}
+| STRING_VALUE
+{
+  $$ = $1;
+}
+| relation_name
+{
+  $$ = $1;
 }
 ;
 
@@ -14692,7 +14762,17 @@ alter_table_action
 ;
 
 alter_table_action:
-opt_set table_option_list_space_seperated
+RETRY AI COLUMN column_name opt_where
+{
+  /* RETRY AI COLUMN <col> [WHERE <pred>]: a control action, not a schema change. children:
+   * [0] the AI column name, [1] the optional WHERE predicate. The node also carries the exact
+   * predicate text (copied out of the input SQL) so the executor never has to search for it. */
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, $5);
+  if (NULL != $5) {
+    dup_expr_string($$, result, @5.first_column, @5.last_column);
+  }
+}
+| opt_set table_option_list_space_seperated
 {
   (void)$1;
   merge_nodes($$, result, T_TABLE_OPTION_LIST, $2);
@@ -18371,6 +18451,7 @@ ACCESSIBLE
 | REPLACE
 | REQUIRE
 | RESIGNAL
+|       RETRY
 | RESTRICT
 | RETURN
 | REVOKE

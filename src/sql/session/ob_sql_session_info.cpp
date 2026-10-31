@@ -129,6 +129,7 @@ ObSQLSessionInfo::ObSQLSessionInfo() :
       read_uncommited_(false),
       trace_recorder_(NULL),
       inner_flag_(false),
+      is_ai_column_worker_(false),
       is_max_availability_mode_(false),
       next_client_ps_stmt_id_(0),
       session_type_(INVALID_TYPE),
