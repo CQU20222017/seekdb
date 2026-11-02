@@ -39,6 +39,141 @@ namespace oceanbase
 {
 namespace sql
 {
+
+namespace
+{
+// TOKENIZE() derives two values from its literal arguments on every evaluation:
+//  - the canonical "name.version" parser name, and
+//  - the canonical parser property JSON (a full JSON parse + rebuild + print).
+// Both are pure functions of the input strings, and in practice the same arguments are
+// evaluated once per row, so memoize the last result per thread to keep the JSON round
+// trip out of the hot path.
+class ObFtsTokenizeParamCache final
+{
+public:
+  ObFtsTokenizeParamCache()
+    : name_alloc_(lib::ObMemAttr("FtsTkParamName")),
+      property_alloc_(lib::ObMemAttr("FtsTkParamProp")),
+      name_key_(),
+      name_value_(),
+      property_parser_key_(),
+      property_key_(),
+      property_value_(),
+      name_cached_(false),
+      property_cached_(false)
+  {
+  }
+  ~ObFtsTokenizeParamCache() = default;
+
+  bool name_hit(const common::ObString &input, common::ObString &value) const
+  {
+    const bool hit = name_cached_ && name_key_ == input;
+    if (hit) {
+      value = name_value_;
+    }
+    return hit;
+  }
+  // Returns false when the cache is full and the caller has to fall back to its
+  // own allocator instead of caching.
+  bool put_name(const common::ObString &input, const char *value, const int64_t value_len,
+                common::ObString &stored_value)
+  {
+    bool stored = false;
+    if (name_alloc_.used() < MAX_CACHE_BYTES) {
+      char *value_buf = static_cast<char *>(name_alloc_.alloc(MAX(value_len, 1)));
+      char *key_buf = OB_NOT_NULL(value_buf)
+                          ? static_cast<char *>(name_alloc_.alloc(MAX(input.length(), 1)))
+                          : nullptr;
+      if (OB_NOT_NULL(value_buf) && OB_NOT_NULL(key_buf)) {
+        if (value_len > 0) {
+          MEMCPY(value_buf, value, value_len);
+        }
+        if (input.length() > 0) {
+          MEMCPY(key_buf, input.ptr(), input.length());
+        }
+        name_value_.assign_ptr(value_buf, static_cast<int32_t>(value_len));
+        name_key_.assign_ptr(key_buf, input.length());
+        name_cached_ = true;
+        stored = true;
+        stored_value = name_value_;
+      }
+    }
+    if (!stored) {
+      // never leave a half-updated key behind: a later lookup must not hit on it
+      name_cached_ = false;
+    }
+    return stored;
+  }
+  bool property_hit(const common::ObString &parser_name, const common::ObString &input,
+                    common::ObString &value) const
+  {
+    const bool hit = property_cached_ && property_parser_key_ == parser_name
+                     && property_key_ == input;
+    if (hit) {
+      value = property_value_;
+    }
+    return hit;
+  }
+  // The rebuilt properties depend on the parser as well as on the user properties, so
+  // both are part of the key.
+  bool put_property(const common::ObString &parser_name, const common::ObString &input,
+                    const common::ObString &value, common::ObString &stored_value)
+  {
+    bool stored = false;
+    const int64_t len = value.length();
+    if (property_alloc_.used() < MAX_CACHE_BYTES) {
+      char *value_buf = static_cast<char *>(property_alloc_.alloc(MAX(len, 1)));
+      char *key_buf = OB_NOT_NULL(value_buf)
+                          ? static_cast<char *>(property_alloc_.alloc(MAX(input.length(), 1)))
+                          : nullptr;
+      char *parser_buf = OB_NOT_NULL(key_buf)
+                             ? static_cast<char *>(
+                                   property_alloc_.alloc(MAX(parser_name.length(), 1)))
+                             : nullptr;
+      if (OB_NOT_NULL(value_buf) && OB_NOT_NULL(key_buf) && OB_NOT_NULL(parser_buf)) {
+        if (len > 0) {
+          MEMCPY(value_buf, value.ptr(), len);
+        }
+        if (input.length() > 0) {
+          MEMCPY(key_buf, input.ptr(), input.length());
+        }
+        if (parser_name.length() > 0) {
+          MEMCPY(parser_buf, parser_name.ptr(), parser_name.length());
+        }
+        property_value_.assign_ptr(value_buf, static_cast<int32_t>(len));
+        property_key_.assign_ptr(key_buf, input.length());
+        property_parser_key_.assign_ptr(parser_buf, parser_name.length());
+        property_cached_ = true;
+        stored = true;
+        stored_value = property_value_;
+      }
+    }
+    if (!stored) {
+      property_cached_ = false;
+    }
+    return stored;
+  }
+
+private:
+  static constexpr int64_t MAX_CACHE_BYTES = 64L << 10;
+  common::ObArenaAllocator name_alloc_;
+  common::ObArenaAllocator property_alloc_;
+  common::ObString name_key_;
+  common::ObString name_value_;
+  common::ObString property_parser_key_;
+  common::ObString property_key_;
+  common::ObString property_value_;
+  bool name_cached_;
+  bool property_cached_;
+};
+
+ObFtsTokenizeParamCache &get_tokenize_param_cache()
+{
+  static thread_local ObFtsTokenizeParamCache cache;
+  return cache;
+}
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -222,15 +357,23 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
 {
   int ret = OB_SUCCESS;
   storage::ObFTParser parser;
+  char parser_name_buf[storage::OB_FT_PARSER_NAME_LENGTH];
+  ObFtsTokenizeParamCache &cache = get_tokenize_param_cache();
 
-  char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
-                = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
+  if (cache.name_hit(input_str, param.parser_name_)) {
+    // reuse the name resolved for the previous evaluation
   } else if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, sizeof(parser_name_buf)))) {
+  } else if (cache.put_name(input_str, parser_name_buf, STRLEN(parser_name_buf), param.parser_name_)) {
+    // resolved once, reused by the following rows
   } else {
-    param.parser_name_ = ObString::make_string(parser_name_buf);
+    char *name_buf = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH));
+    if (OB_ISNULL(name_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(name_buf, parser_name_buf, STRLEN(parser_name_buf) + 1);
+      param.parser_name_ = ObString::make_string(name_buf);
+    }
   }
   return ret;
 }
@@ -352,20 +495,21 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
   } else {
     bool is_null = false;
     if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, mm_alloc, 2, base, is_null))) {
+    } else if (is_null || OB_ISNULL(base)) {
+      // NULL parser properties mean "no properties": keep the parser defaults instead of
+      // dereferencing the missing document.
+    } else if (ObJsonNodeType::J_ARRAY != base->json_type()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser args should be in an array.");
     } else {
-      if (ObJsonNodeType::J_ARRAY != base->json_type()) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser args should be in an array.");
-      } else {
-        for (uint64_t i = 0; OB_SUCC(ret) && i < base->element_count(); ++i) {
-          ObIJsonBase *node = nullptr;
-          if (OB_FAIL(base->get_array_element(i, node))) {
-          } else if (ObJsonNodeType::J_OBJECT != (node->json_type())) {
-            ret = OB_INVALID_ARGUMENT;
-          } else if (OB_FAIL(param.parse_json_param(node))) {
-          }
-        } // for
-      }
+      for (uint64_t i = 0; OB_SUCC(ret) && i < base->element_count(); ++i) {
+        ObIJsonBase *node = nullptr;
+        if (OB_FAIL(base->get_array_element(i, node))) {
+        } else if (ObJsonNodeType::J_OBJECT != (node->json_type())) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (OB_FAIL(param.parse_json_param(node))) {
+        }
+      } // for
     }
   }
 
@@ -376,14 +520,24 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
 {
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
+  ObFtsTokenizeParamCache &cache = get_tokenize_param_cache();
+  ObString formatted;
 
-  if (OB_FAIL(parser_properties.init())) {
+  // The rebuilt properties only depend on (parser name, user properties), so evaluating
+  // them once per distinct argument pair is enough: this used to run a JSON parse, a
+  // rebuild and a JSON print for every single row.
+  if (cache.property_hit(parser_name_, properties, properties_)) {
+    // reused
+  } else if (OB_FAIL(parser_properties.init())) {
   } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, formatted))) {
+  } else if (!cache.put_property(parser_name_, properties, formatted, properties_)) {
+    // cache full: fall back to the per-evaluation allocator
+    properties_ = formatted;
   }
 
   return ret;

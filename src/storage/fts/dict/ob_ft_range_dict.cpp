@@ -44,6 +44,26 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+// utf8mb4_bin collation compares raw bytes, so byte order equals collation order.
+// Using it directly avoids the generic collation dispatch on the tokenize hot path
+// (this helper is called once per character while dictionary matching).
+OB_INLINE int ft_bin_strcmp(const ObString &l, const ObString &r)
+{
+  const int64_t n = l.length() < r.length() ? l.length() : r.length();
+  int cmp = (n > 0) ? MEMCMP(l.ptr(), r.ptr(), n) : 0;
+  if (0 == cmp) {
+    if (l.length() < r.length()) {
+      cmp = -1;
+    } else if (l.length() > r.length()) {
+      cmp = 1;
+    }
+  }
+  return cmp;
+}
+} // namespace
+
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
 {
@@ -382,17 +402,41 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+  if (OB_UNLIKELY(0 == range_dicts_.size())) {
+    ret = OB_ENTRY_NOT_EXIST;
+  } else if (is_sorted_) {
+    // Ranges are built in ascending start-word order and never overlap, so the range
+    // that may contain the word is the last one whose start is <= the word.
+    int64_t lo = 0;
+    int64_t hi = range_dicts_.size() - 1;
+    int64_t pos = -1;
+    while (lo <= hi) {
+      const int64_t mid = lo + ((hi - lo) >> 1);
+      if (ft_bin_strcmp(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+        pos = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (pos >= 0 && ft_bin_strcmp(range_dicts_[pos].end_.get_word(), single_word) >= 0) {
+      dict = range_dicts_[pos].dict_;
       found = true;
+    }
+  } else {
+    // Unordered ranges: keep the original scan (and the generic collation compare).
+    for (int64_t i = 0; !found && i < range_dicts_.size(); ++i) {
+      if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                            range_dicts_[i].start_.get_word(),
+                            single_word)
+              <= 0
+          && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                               range_dicts_[i].end_.get_word(),
+                               single_word)
+                 >= 0) {
+        dict = range_dicts_[i].dict_;
+        found = true;
+      }
     }
   }
   if (!found) {
@@ -405,6 +449,9 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
 {
   int ret = OB_SUCCESS;
+  // Byte order only equals collation order for the binary utf8mb4 collation used by the
+  // built-in range dictionaries; every other collation keeps the generic compare path.
+  is_sorted_ = (ObCollationType::CS_TYPE_UTF8MB4_BIN == desc_.coll_type_);
   for (ObList<ObFTCacheRangeHandle *, ObIAllocator>::const_iterator iter = range_container.get_handles().begin();
        OB_SUCC(ret) && iter != range_container.get_handles().end();
        iter++) {
@@ -418,6 +465,13 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       range.start_ = dat->start_word_;
       range.end_ = dat->end_word_;
       range.dict_ = dict;
+      // Range dictionaries are generated in ascending key order; remember whether that
+      // holds so that matching can binary search instead of scanning every range.
+      if (0 != range_dicts_.size()
+          && ft_bin_strcmp(range_dicts_[range_dicts_.size() - 1].start_.get_word(),
+                           range.start_.get_word()) >= 0) {
+        is_sorted_ = false;
+      }
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }

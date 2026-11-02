@@ -74,23 +74,30 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  
-  
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     common::ObString cmp_str;
-    // do nothing set out with in if type is the same.
-    if (OB_FAIL(common::ObCharset::charset_convert(
-                                       allocator,
+    if (word.get_collation_type() == stopword_type_.get_collation_type()) {
+      // Same charset: charset_convert only copies the input, so skip it entirely.
+      cmp_str = word.get_word().get_string();
+    } else {
+      // Reuse one scratch arena per thread instead of building a throw-away allocator
+      // (and its first block) for every token that reaches the stopword check.
+      static thread_local common::ObArenaAllocator convert_allocator(lib::ObMemAttr("ChkStopWord"));
+      convert_allocator.reuse();
+      if (OB_FAIL(common::ObCharset::charset_convert(
+                                       convert_allocator,
                                        word.get_word().get_string(),
                                        word.get_collation_type(),
                                        stopword_type_.get_collation_type(),
                                        cmp_str))) {
-    } else {
+      }
+    }
+    if (OB_SUCC(ret)) {
       ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
       ret = stopword_set_.exist_refactored(converted);
       if (OB_HASH_NOT_EXIST == ret) {
