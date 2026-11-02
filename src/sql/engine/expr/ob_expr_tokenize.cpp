@@ -360,19 +360,39 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
   char parser_name_buf[storage::OB_FT_PARSER_NAME_LENGTH];
   ObFtsTokenizeParamCache &cache = get_tokenize_param_cache();
 
-  if (cache.name_hit(input_str, param.parser_name_)) {
+if (cache.name_hit(input_str, param.parser_name_)) {
     // reuse the name resolved for the previous evaluation
   } else if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, sizeof(parser_name_buf)))) {
-  } else if (cache.put_name(input_str, parser_name_buf, STRLEN(parser_name_buf), param.parser_name_)) {
-    // resolved once, reused by the following rows
   } else {
-    char *name_buf = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH));
-    if (OB_ISNULL(name_buf)) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
+    int64_t parser_name_len = -1;
+    const int64_t name_len = parser.get_parser_name().len();
+    // init() validates the builtin name and selects version 1. Keep the
+    // general serializer for any other version or unexpectedly long name.
+    if (parser.get_parser_version() == 1 && parser.is_valid()
+        && name_len <= storage::OB_FT_PARSER_NAME_LENGTH - 3) {
+      MEMCPY(parser_name_buf, parser.get_parser_name().str(), name_len);
+      parser_name_buf[name_len] = '.';
+      parser_name_buf[name_len + 1] = '1';
+      parser_name_buf[name_len + 2] = '\0';
+      parser_name_len = name_len + 2;
+    } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf,
+                                              storage::OB_FT_PARSER_NAME_LENGTH))) {
     } else {
-      MEMCPY(name_buf, parser_name_buf, STRLEN(parser_name_buf) + 1);
-      param.parser_name_ = ObString::make_string(name_buf);
+      parser_name_len = static_cast<int64_t>(STRLEN(parser_name_buf));
+    }
+    if (OB_SUCC(ret)) {
+      if (cache.put_name(input_str, parser_name_buf, parser_name_len, param.parser_name_)) {
+        // resolved once, reused by the following rows
+      } else {
+        char *name_buf = static_cast<char *>(
+            param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH));
+        if (OB_ISNULL(name_buf)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          MEMCPY(name_buf, parser_name_buf, parser_name_len + 1);
+          param.parser_name_ = ObString(static_cast<int32_t>(parser_name_len), name_buf);
+        }
+      }
     }
   }
   return ret;
@@ -518,6 +538,11 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
 
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
 {
+  // The parser helper initializes an omitted configuration from the same
+  // built-in defaults. Avoid serializing those defaults only to parse them again.
+  if (properties.empty()) {
+    return OB_SUCCESS;
+  }
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
   ObFtsTokenizeParamCache &cache = get_tokenize_param_cache();

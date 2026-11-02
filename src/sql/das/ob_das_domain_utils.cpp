@@ -117,6 +117,26 @@ int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
   return ret;
 }
 
+int ObFTIndexRowCache::get_next_rows(
+    const int64_t capacity, blocksstable::ObDatumRow *const *&rows, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  rows = nullptr;
+  count = 0;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(capacity <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (row_idx_ >= rows_.count()) {
+    ret = OB_ITER_END;
+  } else {
+    count = MIN(capacity, rows_.count() - static_cast<int64_t>(row_idx_));
+    rows = rows_.get_data() + row_idx_;
+    row_idx_ += count;
+  }
+  return ret;
+}
+
 void ObFTIndexRowCache::reset()
 {
   rows_.reset();

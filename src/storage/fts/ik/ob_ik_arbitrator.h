@@ -61,7 +61,10 @@ private:
 
 private:
   ObArenaAllocator alloc_;
-  hash::ObHashMap<int64_t, ObIKTokenChain *> chains_;
+  // The winning token chains, ordered by the offset they start at. A list
+  // plus a forward cursor replaces the per character hash lookup that the
+  // output pass used to do.
+  ObList<ObIKTokenChain *, ObIAllocator> chains_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObIKArbitrator);

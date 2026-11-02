@@ -11990,6 +11990,27 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
   return ret;
 }
 
+// Check all uses conservatively: only a direct boolean test may discard the
+// numeric score. Other MATCH expressions and arithmetic retain scored execution.
+static int check_membership_only_match(ObRawExpr *expr, ObRawExpr *match, bool &need_score)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (expr->get_expr_type() == T_OP_BOOL && expr->get_param_count() == 1
+      && expr->get_param_expr(0) == match) {
+    // membership only
+  } else if (expr->get_expr_type() == T_FUN_MATCH_AGAINST) {
+    need_score = true;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !need_score && i < expr->get_param_count(); ++i) {
+      if (OB_FAIL(SMART_CALL(check_membership_only_match(expr->get_param_expr(i), match, need_score)))) {
+      }
+    }
+  }
+  return ret;
+}
+
 int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                            const ObIArray<ObRawExpr *> &scan_match_filters,
                                            const ObIArray<ObRawExpr *> &all_match_filters,
@@ -12042,6 +12063,35 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
+    // A natural-language predicate needs membership, not BM25 scores. Keep
+    // scored execution for ordered LIMIT/top-k, boolean/weighted search, and every
+    // expression that observes the numeric score (including ORDER/HAVING).
+    if (get_stmt()->is_select_stmt() && get_stmt()->is_single_table_stmt()
+        && (!get_stmt()->has_limit() || get_stmt()->get_order_item_size() == 0)
+        && !get_stmt()->has_subquery()
+        && !table_scan->is_vec_adaptive_scan()
+        && !table_scan->is_vec_idx_scan_post_filter()
+        && match_against->get_mode_flag() == NATURAL_LANGUAGE_MODE
+        && match_against->get_columns_boosts().empty()
+        && match_against->get_param_text_expr() == nullptr
+        && match_pred->get_expr_type() == T_OP_BOOL
+        && match_pred->get_param_count() == 1
+        && match_pred->get_param_expr(0) == match_against) {
+      ObSEArray<ObRawExpr *, 16> exprs;
+      bool need_score = false;
+      if (OB_FAIL(get_stmt()->get_relation_exprs(exprs))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && !need_score && i < exprs.count(); ++i) {
+        if (OB_FAIL(check_membership_only_match(exprs.at(i), match_against, need_score))) {
+        }
+      }
+      if (OB_SUCC(ret) && !need_score) {
+        // Keep the plan text identical to what the statement asks for: only the
+        // execution flag is cleared, EXPLAIN still reports calc_relevance=true.
+        tr_info.display_calc_relevance_ = tr_info.need_calc_relevance_;
+        tr_info.need_calc_relevance_ = false;
+      }
+    }
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {

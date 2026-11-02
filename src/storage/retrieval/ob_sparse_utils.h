@@ -52,6 +52,34 @@ struct ObSRDaaTInnerProductRelevanceCollector : ObSRDaaTRelevanceCollector
   virtual void reuse() override;
   virtual int collect_one_dim(const int64_t dim_idx, const double) override;
   virtual int get_result(double &relevance, bool &is_valid) override;
+  // Native unscored text dimensions contribute exactly one before weighting.
+  // Evaluate the same ordered sum and minimum-match condition without mutating
+  // the per-dimension collector state.
+  OB_INLINE int evaluate_membership(
+      const int64_t dim_count, const uint64_t matches,
+      const common::ObIArray<double> *weights, const double field_boost,
+      double &relevance, bool &is_valid) const
+  {
+    int ret = common::OB_SUCCESS;
+    if (dim_count < 0 || dim_count > 64
+        || (nullptr != weights && weights->count() < dim_count)
+        || (dim_count < 64 && (matches >> dim_count) != 0)) {
+      ret = common::OB_INVALID_ARGUMENT;
+    } else {
+      relevance = 0.0;
+      int64_t matched = 0;
+      for (int64_t i = 0; i < dim_count; ++i) {
+        if ((matches & (uint64_t(1) << i)) != 0) {
+          double score = 1.0;
+          if (nullptr != weights) score *= field_boost * weights->at(i);
+          relevance += score;
+          ++matched;
+        }
+      }
+      is_valid = matched >= should_match_;
+    }
+    return ret;
+  }
 private:
   double total_relevance_;
   int64_t matched_cnt_;

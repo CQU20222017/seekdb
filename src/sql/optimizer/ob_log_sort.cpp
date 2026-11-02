@@ -92,7 +92,7 @@ int ObLogSort::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
                               can_sort_opt, *get_plan(), child->get_card()))) {
   } else if (NULL != topn_expr_ && FALSE_IT(can_sort_opt = false)) {
     // do nothing
-  } else if ((is_prefix_sort() ? get_prefix_pos() : get_part_cnt() == sort_keys_.count()) && 
+  } else if ((is_prefix_sort() ? get_prefix_pos() : get_part_cnt()) == sort_keys_.count() &&
         FALSE_IT(can_sort_opt = false)) {
     // do nothing
   } else if (can_sort_opt && OB_FAIL(create_encode_sortkey_expr(sort_keys_))) {

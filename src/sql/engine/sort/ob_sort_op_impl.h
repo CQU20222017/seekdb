@@ -545,7 +545,7 @@ public:
       {
         aqs_cps_qs(0, sort_rows_.count(), 0, 0, 0);
         for (int64_t i = 0; i < sort_rows_.count() && i < (rows_end - rows_begin); ++i) {
-          orig_sort_rows_.at(i + rows_begin) = sort_rows_.at(i).row_ptr_;
+          orig_sort_rows_.at(i + rows_begin) = sort_rows_.get_data()[i].row_ptr_;
         }
       }
       void reset()
@@ -566,7 +566,7 @@ public:
                             int64_t common_prefix,
                             int64_t cache_offset);
       inline void swap(int64_t l, int64_t r) {
-        std::swap(sort_rows_[r], sort_rows_[l]);
+        std::swap(sort_rows_.get_data()[r], sort_rows_.get_data()[l]);
       }
       inline int compare_vals(int64_t l, int64_t r, int64_t &differ_at,
                               int64_t common_prefix, int64_t cache_offset);

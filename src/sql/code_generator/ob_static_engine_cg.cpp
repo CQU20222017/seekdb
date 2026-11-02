@@ -481,6 +481,21 @@ int ObStaticEngineCG::check_vectorize_supported(bool &support,
       } else if (log_op_def::LOG_TABLE_SCAN == op->get_type()) {
          LOG_DEBUG("TableScan base table rows ", K(op->get_card()));
          scan_cardinality = common::max(scan_cardinality, op->get_card());
+         if (scan_cardinality < ObStaticEngineExprCG::SMALL_SCAN_CARDINALITY
+             && log_plan->get_optimizer_context().is_insert_stmt_in_online_ddl()) {
+           const TableItem *item = log_plan->get_optimizer_context().get_root_stmt()->get_table_item(0);
+           if (OB_ISNULL(item)) {
+             ret = OB_ERR_UNEXPECTED;
+           } else if (OB_FAIL(schema_guard->get_table_schema(item->ddl_table_id_, table_schema))) {
+           } else if (OB_ISNULL(table_schema)) {
+             ret = OB_ERR_UNEXPECTED;
+           } else if (table_schema->is_fts_index_aux() || table_schema->is_fts_doc_word_aux()) {
+             // A source document expands into many postings. Its estimated row
+             // count must not force the posting pipeline into tiny batches.
+             // Expression widths and configured batch limits still apply.
+             scan_cardinality = ObStaticEngineExprCG::SMALL_SCAN_CARDINALITY;
+           }
+         }
       }
       if (OB_SUCC(ret) && !disable_vectorize) {
         const ObDMLStmt *stmt = NULL;
@@ -783,10 +798,13 @@ int ObStaticEngineCG::generate_spec_final(ObLogicalOperator &op, ObOpSpec &spec)
     ObTableScanSpec &tsc_spec = static_cast<ObTableScanSpec&>(spec);
     ObDASScanCtDef &scan_ctdef = tsc_spec.tsc_ctdef_.scan_ctdef_;
     ObDASScanCtDef *lookup_ctdef = tsc_spec.tsc_ctdef_.lookup_ctdef_;
-    if (OB_FAIL(scan_ctdef.pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
+    // FTS expands one source document into a batch of postings. The source
+    // scanner still uses get_next_row, including its checksum and LOB handling.
+    const int64_t storage_batch_size = tsc_spec.is_fts_ddl_ ? 0 : tsc_spec.max_batch_size_;
+    if (OB_FAIL(scan_ctdef.pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, storage_batch_size))) {
     } else if (lookup_ctdef != nullptr &&
-        OB_FAIL(lookup_ctdef->pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
-    } else if (OB_FAIL(tsc_spec.tsc_ctdef_.attach_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
+        OB_FAIL(lookup_ctdef->pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, storage_batch_size))) {
+    } else if (OB_FAIL(tsc_spec.tsc_ctdef_.attach_spec_.set_calc_exprs(spec.calc_exprs_, storage_batch_size))) {
     }
   }
 
@@ -3681,7 +3699,6 @@ int ObStaticEngineCG::generate_normal_tsc(ObLogTableScan &op, ObTableScanSpec &s
       } else if (ddl_table_schema->is_fts_index_aux() || ddl_table_schema->is_fts_doc_word_aux()) {
         spec.is_fts_ddl_ = true;
         spec.is_fts_index_aux_ = ddl_table_schema->is_fts_index_aux();
-        spec.max_batch_size_ = 0; // TODO: @jinzhu, remove me later after support post-building fts index vectorization.
         if (OB_UNLIKELY(ddl_table_schema->get_parser_name_str().empty())) {
           ret = OB_ERR_UNEXPECTED;
         } else {

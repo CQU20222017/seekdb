@@ -5486,6 +5486,30 @@ int ObTxCtx::submit_rollback_to_log_(const ObTxSEQ from_scn,
   return ret;
 }
 
+int ObTxCtx::abort_recovered_local_transaction(bool &pending)
+{
+  int ret = OB_SUCCESS;
+  pending = false;
+  CtxLockGuard guard(lock_);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (is_exiting_ || get_downstream_state() >= ObTxState::COMMIT) {
+  } else if (is_for_replay()) {
+    // A prepared transaction needs its original decision; do not guess it.
+    if (get_downstream_state() != ObTxState::INIT || !replay_completeness_.is_complete()) {
+      // Keep prepared or incomplete contexts on their existing decision path.
+    } else if (OB_FAIL(mt_ctx_.replay_to_commit(false /*is_resume*/))) {
+    } else {
+      for_replay_ = false;
+      pending = true;
+      ret = abort_(ObTxAbortCause::IMPLICIT_ROLLBACK);
+    }
+  } else if (part_trans_action_ == ObPartTransAction::ABORT) {
+    pending = true;
+  }
+  return ret;
+}
+
 int ObTxCtx::abort(const int reason)
 {
   UNUSED(reason);

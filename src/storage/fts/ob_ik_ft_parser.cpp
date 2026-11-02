@@ -16,7 +16,7 @@
 
 #define USING_LOG_PREFIX STORAGE_FTS
 
-#include "src/storage/fts/ob_ik_ft_parser.h"
+#include "storage/fts/ob_ik_ft_parser.h"
 
 #include "lib/charset/ob_charset.h"
 #include "lib/ob_errno.h"
@@ -135,10 +135,10 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
 {
   int ret = OB_SUCCESS;
   // proces by char with all segmenters
-  for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
-       OB_SUCC(ret) && iter != segmenters_.end();
-       iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
+    // process_next_batch already fetched this character. Processors append
+    // tokens without advancing the context; only the outer loop steps it.
+    if (OB_FAIL(segmenters_[i]->do_process(ctx, ch, char_len, type))) {
     }
   }
   return ret;
@@ -248,17 +248,11 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
                               ObCharsetType::CHARSET_UTF8MB4,
                               ObCollationType::CS_TYPE_UTF8MB4_BIN);
 
-  ObFTDictDesc stopword_dict_desc("stopword",
-                                  ObFTDictType::DICT_IK_STOP,
-                                  ObCharsetType::CHARSET_UTF8MB4,
-                                  ObCollationType::CS_TYPE_UTF8MB4_BIN);
-
   if (should_read_newest_table()) {
     // clear dict cache, always false now
   } else {
     if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
     } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
-    } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
     }
   }
 
@@ -266,8 +260,11 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
     // already logged.
   } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
   } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
   }
+
+  // Only the main and quantifier dictionaries participate in IK processing.
+  // Stopword filtering is not enabled in get_next_token(); do not pin and
+  // materialize an unused dictionary for every document.
 
   return ret;
 }
@@ -327,16 +324,13 @@ int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_ISNULL(surrogate_seg = OB_NEWx(ObIKSurrogateProcessor, &allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(segmenters_.push_back(letter_seg))) {
-  } else if (FALSE_IT(letter_seg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(cnqsg))) {
-  } else if (FALSE_IT(cnqsg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(cjksg))) {
-  } else if (FALSE_IT(cjksg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(surrogate_seg))) {
-  } else if (OB_FALSE_IT(surrogate_seg = nullptr)) {
+  } else {
+    segmenters_[0] = letter_seg;
+    segmenters_[1] = cnqsg;
+    segmenters_[2] = cjksg;
+    segmenters_[3] = surrogate_seg;
   }
-  // push back by order, quantifier is before cjk
+  // Preserve processor order: quantifier must precede CJK.
 
   if (OB_FAIL(ret)) {
     OB_DELETEx(ObIKLetterProcessor, &allocator_, letter_seg);
@@ -354,13 +348,13 @@ void ObIKFTParser::reset()
     allocator_.free(ctx_);
   }
 
-  for (ObIIKProcessor *segmenter : segmenters_) {
+  for (ObIIKProcessor *&segmenter : segmenters_) {
     if (!OB_ISNULL(segmenter)) {
       segmenter->~ObIIKProcessor();
       allocator_.free(segmenter);
+      segmenter = nullptr;
     }
   }
-  segmenters_.clear();
 
   cache_main_.reset();
   cache_quan_.reset();

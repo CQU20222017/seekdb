@@ -6945,6 +6945,7 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
   ObSEArray<ObRawExpr *, 4> sort_keys;
   double avg_len = 0;
   bool has_hint = false;
+  bool is_fts_build = false;
   can_sort_opt = true;
   bool old_can_opt = false;
   const ObOptParamHint opt_params = plan.get_optimizer_context().get_global_hint().opt_params_;
@@ -6952,13 +6953,38 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
   } else if (has_hint) {
     if (OB_FAIL(opt_params.get_bool_opt_param(ObOptParamHint::ENABLE_NEWSORT, can_sort_opt))) {
     }
+    // A hint chooses the strategy, but cannot make an unsupported datum type
+    // encodable. In particular, prefix sorts can also contain LOB keys.
+    for (int64_t i = 0; OB_SUCC(ret) && can_sort_opt && i < order_keys.count(); ++i) {
+      const ObObjType type = order_keys.at(i).expr_->get_data_type();
+      const ObCollationType cs = order_keys.at(i).expr_->get_collation_type();
+      can_sort_opt = ObOrderPerservingEncoder::can_encode_sortkey(type, cs)
+          || (type == ObVarcharType && ObOrderPerservingEncoder::can_encode_sortkey(ObCharType, cs));
+    }
   } else {
     can_sort_opt &= config::_enable_newsort();
 
+    if (can_sort_opt && plan.get_optimizer_context().is_insert_stmt_in_online_ddl()) {
+      const TableItem *item = plan.get_optimizer_context().get_root_stmt()->get_table_item(0);
+      const schema::ObTableSchema *table = nullptr;
+      auto *guard = plan.get_optimizer_context().get_sql_schema_guard();
+      if (OB_ISNULL(item) || OB_ISNULL(guard)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(guard->get_table_schema(item->ddl_table_id_, table))) {
+      } else if (OB_ISNULL(table)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        is_fts_build = table->is_fts_index_aux() || table->is_fts_doc_word_aux();
+      }
+    }
+
     for (int64_t i = 0; OB_SUCC(ret) && can_sort_opt && i < order_keys.count(); i++) {
-      if (!ObOrderPerservingEncoder::can_encode_sortkey(
-                            order_keys.at(i).expr_->get_data_type(),
-                            order_keys.at(i).expr_->get_collation_type())) {
+      const ObObjType type = order_keys.at(i).expr_->get_data_type();
+      const ObCollationType cs = order_keys.at(i).expr_->get_collation_type();
+      if (!ObOrderPerservingEncoder::can_encode_sortkey(type, cs)
+          && !(is_fts_build && type == ObVarcharType
+               && (cs == CS_TYPE_BINARY || cs == CS_TYPE_UTF8MB4_BIN
+                   || cs == CS_TYPE_UTF8MB4_GENERAL_CI))) {
         can_sort_opt = false;
       } else if (OB_FAIL(sort_keys.push_back(order_keys.at(i).expr_))) {
       } else { /* do nothing */ }
@@ -6974,9 +7000,14 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
                                                               plan.get_selectivity_ctx(),
                                                               sort_keys,
                                                               avg_len))) {
-    } else if (avg_len > 256) {
-      can_sort_opt = false;
+    }
+    if (OB_FAIL(ret) || !can_sort_opt) {
+    } else if (is_fts_build) {
+      // One source row expands into many posting rows with repeated word
+      // keys. Encode those keys once instead of collating on every comparison.
     } else if (card < 1000) {
+      can_sort_opt = false;
+    } else if (avg_len > 256) {
       can_sort_opt = false;
     } else if (avg_len < 64 && card < 100000) {
       can_sort_opt = false;

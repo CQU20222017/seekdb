@@ -79,58 +79,40 @@ private:
 
 private:
   /*************************  Alpha: english letter abc *********************/
-  template <ObCharsetType CS_TYPE>
-  static typename std::enable_if<(CS_TYPE == CHARSET_UTF8MB4 || CS_TYPE == CHARSET_UTF16
-                                  || CS_TYPE == CHARSET_UTF16LE),
-                                 int>::type
-  is_alpha(const char *input, const uint8_t char_len, bool &is_alpha);
+  // The unicode block tables are pure functions of the decoded code point, so
+  // the code point level predicates are the single source of truth. A caller
+  // that already decoded the character must not decode it again.
+  static bool is_alpha_code_point(const ob_wc_t unicode);
   /****************************************************************************************/
 
   /*************************  Arabic: num letter 123 *********************/
-
-  template <ObCharsetType CS_TYPE>
-  static typename std::enable_if<(CS_TYPE == CHARSET_UTF8MB4 || CS_TYPE == CHARSET_UTF16
-                                  || CS_TYPE == CHARSET_UTF16LE),
-                                 int>::type
-  is_arabic(const char *input, const uint8_t char_len, bool &is_arabic);
+  static bool is_arabic_code_point(const ob_wc_t unicode);
   /****************************************************************************************/
 
   /*************************  Chinese: Characters *********************/
-  template <ObCharsetType CS_TYPE>
-  static typename std::enable_if<(CS_TYPE == CHARSET_UTF8MB4 || CS_TYPE == CHARSET_UTF16
-                                  || CS_TYPE == CHARSET_UTF16LE),
-                                 int>::type
-  is_chinese(const char *input, const uint8_t char_len, bool &is_chinese);
+  static bool is_chinese_code_point(const ob_wc_t unicode);
   /****************************************************************************************/
 
   /*************************  Other CJK:  Japanese Korean Chinese *********************/
-  template <ObCharsetType CS_TYPE>
-  static typename std::enable_if<(CS_TYPE == CHARSET_UTF8MB4 || CS_TYPE == CHARSET_UTF16
-                                  || CS_TYPE == CHARSET_UTF16LE),
-                                 int>::type
-  is_other_cjk(const char *input, const uint8_t char_len, bool &is_other_cjk);
+  static bool is_other_cjk_code_point(const ob_wc_t unicode);
   /****************************************************************************************/
 
   /*************************  Surrogate: only for UTF16 *********************/
   template <ObCharsetType CS_TYPE>
-  static
-      typename std::enable_if<(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), int>::type
-      is_surrogate_high(const char *input, const uint8_t char_len, bool &is_surrogate_high);
+  static typename std::enable_if<(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), bool>::type
+  is_surrogate_high_code_point(const ob_wc_t unicode);
 
   template <ObCharsetType CS_TYPE>
-  static
-      typename std::enable_if<(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), int>::type
-      is_surrogate_low(const char *input, const uint8_t char_len, bool &is_surrogate_low);
+  static typename std::enable_if<(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), bool>::type
+  is_surrogate_low_code_point(const ob_wc_t unicode);
 
   template <ObCharsetType CS_TYPE>
-  static
-      typename std::enable_if<!(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), int>::type
-      is_surrogate_high(const char *input, const uint8_t char_len, bool &is_surrogate_high);
+  static typename std::enable_if<!(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), bool>::type
+  is_surrogate_high_code_point(const ob_wc_t unicode);
 
   template <ObCharsetType CS_TYPE>
-  static
-      typename std::enable_if<!(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), int>::type
-      is_surrogate_low(const char *input, const uint8_t char_len, bool &is_surrogate_low);
+  static typename std::enable_if<!(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), bool>::type
+  is_surrogate_low_code_point(const ob_wc_t unicode);
   /****************************************************************************************/
 
   /*************************  Ignore: some char should not output itself *********************/
@@ -190,108 +172,54 @@ private:
   }
 }; // End of class.
 
-template <ObCharsetType CS_TYPE>
-inline typename std::enable_if<(CS_TYPE == CHARSET_UTF8MB4 || CS_TYPE == CHARSET_UTF16
-                                || CS_TYPE == CHARSET_UTF16LE),
-                               int>::type
-ObFTCharUtil::is_alpha(const char *input, const uint8_t char_len, bool &is_alpha)
+inline bool ObFTCharUtil::is_alpha_code_point(const ob_wc_t unicode)
 {
-  int ret = OB_SUCCESS;
-  ob_wc_t unicode = 0;
-  if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else {
-    is_alpha = ObUnicodeBlockUtils::is_alpha(unicode);
-  }
-  return ret;
+  return ObUnicodeBlockUtils::is_alpha(unicode);
+}
+
+inline bool ObFTCharUtil::is_arabic_code_point(const ob_wc_t unicode)
+{
+  return ObUnicodeBlockUtils::is_arabic(unicode);
+}
+
+inline bool ObFTCharUtil::is_chinese_code_point(const ob_wc_t unicode)
+{
+  return ObUnicodeBlockUtils::is_chinese(unicode);
+}
+
+inline bool ObFTCharUtil::is_other_cjk_code_point(const ob_wc_t unicode)
+{
+  return ObUnicodeBlockUtils::is_other_cjk(unicode);
 }
 
 template <ObCharsetType CS_TYPE>
-inline typename std::enable_if<(CS_TYPE == CHARSET_UTF8MB4 || CS_TYPE == CHARSET_UTF16
-                                || CS_TYPE == CHARSET_UTF16LE),
-                               int>::type
-ObFTCharUtil::is_arabic(const char *input, const uint8_t char_len, bool &is_arabic)
+inline typename std::enable_if<(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), bool>::type
+ObFTCharUtil::is_surrogate_high_code_point(const ob_wc_t unicode)
 {
-  int ret = OB_SUCCESS;
-  ob_wc_t unicode = 0;
-  if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else {
-    is_arabic = ObUnicodeBlockUtils::is_arabic(unicode);
-  }
-  return ret;
+  return ObUnicodeBlockUtils::check_high_surrogate(unicode);
 }
 
 template <ObCharsetType CS_TYPE>
-inline typename std::enable_if<(CS_TYPE == CHARSET_UTF8MB4 || CS_TYPE == CHARSET_UTF16
-                                || CS_TYPE == CHARSET_UTF16LE),
-                               int>::type
-ObFTCharUtil::is_chinese(const char *input, const uint8_t char_len, bool &is_chinese)
+inline typename std::enable_if<(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), bool>::type
+ObFTCharUtil::is_surrogate_low_code_point(const ob_wc_t unicode)
 {
-  int ret = OB_SUCCESS;
-  ob_wc_t unicode = 0;
-  if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else {
-    is_chinese = ObUnicodeBlockUtils::is_chinese(unicode);
-  }
-  return ret;
+  return ObUnicodeBlockUtils::check_low_surrogate(unicode);
 }
 
 template <ObCharsetType CS_TYPE>
-inline typename std::enable_if<(CS_TYPE == CHARSET_UTF8MB4 || CS_TYPE == CHARSET_UTF16
-                                || CS_TYPE == CHARSET_UTF16LE),
-                               int>::type
-ObFTCharUtil::is_other_cjk(const char *input, const uint8_t char_len, bool &is_other_cjk)
+inline typename std::enable_if<!(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), bool>::type
+ObFTCharUtil::is_surrogate_high_code_point(const ob_wc_t unicode)
 {
-  int ret = OB_SUCCESS;
-  ob_wc_t unicode = 0;
-  if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else {
-    is_other_cjk = ObUnicodeBlockUtils::is_other_cjk(unicode);
-  }
-  return ret;
+  UNUSED(unicode);
+  return false;
 }
 
 template <ObCharsetType CS_TYPE>
-inline typename std::enable_if<(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), int>::type
-ObFTCharUtil::is_surrogate_high(const char *input, const uint8_t char_len, bool &is_surrogate_high)
+inline typename std::enable_if<!(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), bool>::type
+ObFTCharUtil::is_surrogate_low_code_point(const ob_wc_t unicode)
 {
-  int ret = OB_SUCCESS;
-  ob_wc_t unicode = 0;
-  if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else {
-    is_surrogate_high = ObUnicodeBlockUtils::check_high_surrogate(unicode);
-  }
-  return ret;
-}
-
-template <ObCharsetType CS_TYPE>
-inline typename std::enable_if<(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), int>::type
-ObFTCharUtil::is_surrogate_low(const char *input, const uint8_t char_len, bool &is_surrogate_low)
-{
-  int ret = OB_SUCCESS;
-  ob_wc_t unicode = 0;
-  if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else {
-    is_surrogate_low = ObUnicodeBlockUtils::check_low_surrogate(unicode);
-  }
-  return ret;
-}
-
-template <ObCharsetType CS_TYPE>
-inline typename std::enable_if<!(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), int>::type
-ObFTCharUtil::is_surrogate_high(const char *input, const uint8_t char_len, bool &is_surrogate_high)
-{
-  int ret = OB_SUCCESS;
-  is_surrogate_high = false;
-  return ret;
-}
-
-template <ObCharsetType CS_TYPE>
-inline typename std::enable_if<!(CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE), int>::type
-ObFTCharUtil::is_surrogate_low(const char *input, const uint8_t char_len, bool &is_surrogate_low)
-{
-  int ret = OB_SUCCESS;
-  is_surrogate_low = false;
-  return ret;
+  UNUSED(unicode);
+  return false;
 }
 
 template <ObCharsetType CS_TYPE>
@@ -451,20 +379,22 @@ inline int ObFTCharUtil::do_classify(const char *input, const uint8_t char_len, 
   // predicates were constant false, so keep them out of the chain entirely.
   constexpr bool IS_UTF16 = (CHARSET_UTF16 == CS_TYPE || CHARSET_UTF16LE == CS_TYPE);
 
-  // Decode the code point once: each predicate below is a pure function of the code
-  // point, so decoding once per predicate only burns CPU on the tokenize hot path.
+// Decode the character once and classify it from the code point. The block
+  // tables only depend on the code point and the predicates are mutually
+  // exclusive, so decoding once per predicate was pure overhead on the
+  // per-character hot path.
   if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else if (ObUnicodeBlockUtils::is_alpha(unicode)) {
+  } else if (is_alpha_code_point(unicode)) {
     type = CharType::ENGLISH_LETTER;
-  } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
+  } else if (is_arabic_code_point(unicode)) {
     type = CharType::ARABIC_LETTER;
-  } else if (ObUnicodeBlockUtils::is_chinese(unicode)) {
+  } else if (is_chinese_code_point(unicode)) {
     type = CharType::CHINESE;
-  } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
+  } else if (is_other_cjk_code_point(unicode)) {
     type = CharType::OTHER_CJK;
-  } else if (IS_UTF16 && ObUnicodeBlockUtils::check_high_surrogate(unicode)) {
+  } else if (is_surrogate_high_code_point<CS_TYPE>(unicode)) {
     type = CharType::SURROGATE_HIGH;
-  } else if (IS_UTF16 && ObUnicodeBlockUtils::check_low_surrogate(unicode)) {
+  } else if (is_surrogate_low_code_point<CS_TYPE>(unicode)) {
     type = CharType::SURROGATE_LOW;
   }
   return ret;

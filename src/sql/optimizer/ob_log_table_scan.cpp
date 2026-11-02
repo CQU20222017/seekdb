@@ -704,7 +704,10 @@ int ObLogTableScan::extract_pushdown_filters(ObIArray<ObRawExpr*> &nonpushdown_f
         } else if (is_vec_adaptive_scan()) {
           add_to_scan_filter = true;
         }
-      } else if (is_text_retrieval_scan() && need_text_retrieval_calc_relevance()) {
+      // A membership-only retrieval still has to apply ordinary row filters
+      // after its index lookup, exactly like a scored retrieval.
+      } else if (is_text_retrieval_scan()
+          && (need_text_retrieval_calc_relevance() || text_retrieval_info_.pushdown_match_filter_ != nullptr)) {
         if (OB_FAIL(nonpushdown_filters.push_back(filters.at(i)))) {
         } else if (is_vec_adaptive_scan()) {
           add_to_scan_filter = true;
@@ -2606,7 +2609,7 @@ int ObLogTableScan::print_text_retrieval_annotation(char *buf, int64_t buf_len, 
   ObRawExpr *limit = tr_info.topk_limit_expr_;
   ObRawExpr *offset = tr_info.topk_offset_expr_;
   ObSEArray<OrderItem, 1> sort_keys;
-  bool calc_relevance = tr_info.need_calc_relevance_;
+  bool calc_relevance = tr_info.display_calc_relevance_;
   if (OB_FAIL(BUF_PRINTF(", "))) {
   } else if (OB_FAIL(BUF_PRINTF("\n      "))) {
   } else if (OB_FAIL(BUF_PRINTF("calc_relevance=%s", calc_relevance ? "true" : "false"))) {

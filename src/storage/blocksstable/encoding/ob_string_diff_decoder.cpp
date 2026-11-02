@@ -25,6 +25,68 @@ namespace oceanbase
 namespace blocksstable
 {
 using namespace common;
+
+namespace {
+// Small strings with few varying bytes occur in sorted keys as well as IDs.
+// Decode their common part once per batch; retain the general descriptor path
+// for larger or dense differences. Output buffers already have a 128-byte stride.
+class SparseStringDiffPlan
+{
+public:
+  bool init(const ObStringDiffHeader &header)
+  {
+    if (header.string_size_ == 0 || header.string_size_ > sizeof(common_)) {
+      return false;
+    }
+    difference_count_ = 0;
+    int64_t position = 0;
+    for (int64_t i = 0; i < header.diff_desc_cnt_; ++i) {
+      const auto &part = header.diff_descs_[i];
+      if (position + part.count_ > header.string_size_) { return false; }
+      if (part.diff_) {
+        if (difference_count_ + part.count_ > ARRAYSIZEOF(positions_)) { return false; }
+        for (int64_t k = 0; k < part.count_; ++k) {
+          positions_[difference_count_++] = position + k;
+        }
+      }
+      position += part.count_;
+    }
+    if (position != header.string_size_) { return false; }
+    MEMSET(common_, 0, sizeof(common_));
+    header.copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
+                       header.common_data(), common_);
+    copy_size_ = header.string_size_ <= 16 ? 16 : header.string_size_ <= 32 ? 32
+        : header.string_size_ <= 64 ? 64 : 128;
+    return true;
+  }
+
+  OB_INLINE void decode(char *destination, const char *data, const unsigned char *hex_chars) const
+  {
+    switch (copy_size_) {
+      case 16: MEMCPY(destination, common_, 16); break;
+      case 32: MEMCPY(destination, common_, 32); break;
+      case 64: MEMCPY(destination, common_, 64); break;
+      default: MEMCPY(destination, common_, 128); break;
+    }
+    if (hex_chars != nullptr) {
+      ObHexStringUnpacker unpacker(hex_chars, reinterpret_cast<const unsigned char *>(data));
+      for (int64_t i = 0; i < difference_count_; ++i) {
+        destination[positions_[i]] = unpacker.unpack();
+      }
+    } else {
+      for (int64_t i = 0; i < difference_count_; ++i) {
+        destination[positions_[i]] = data[i];
+      }
+    }
+  }
+private:
+  char common_[128];
+  uint8_t positions_[16];
+  int64_t difference_count_;
+  int64_t copy_size_;
+};
+} // namespace
+
 const ObColumnHeader::Type ObStringDiffDecoder::type_;
 
 ObStringDiffDecoder::ObStringDiffDecoder() : header_(NULL)
@@ -161,11 +223,14 @@ int ObStringDiffDecoder::batch_decode(
     const uint16_t string_size = header_->string_size_;
     const static uint16_t min_buf_size = 128;
     const int64_t buf_size = std::max(string_size, min_buf_size);
+    SparseStringDiffPlan plan;
+    const bool sparse_plan = row_cap > 1 && plan.init(*header_);
+    const unsigned char *hex_chars = header_->is_hex_packing() ? header_->hex_char_array() : nullptr;
     char *buf = nullptr;
     if (OB_FAIL(ret)) {
     } else if (OB_ISNULL(buf = static_cast<char *>(ctx.allocator_->alloc(buf_size * row_cap)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else {
+    } else if (!sparse_plan) {
       for (int64_t i = 0; i < row_cap; ++i) {
         header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
             header_->common_data(), buf + i * buf_size);
@@ -184,7 +249,9 @@ int ObStringDiffDecoder::batch_decode(
           row_id = row_ids[i];
           cell_data = col_data + data_offset + row_id * header_->length_;
           str_ptr = buf + i * buf_size;
-          if (header_->is_hex_packing()) {
+          if (sparse_plan) {
+            plan.decode(str_ptr, reinterpret_cast<const char *>(cell_data), hex_chars);
+          } else if (header_->is_hex_packing()) {
             ObHexStringUnpacker unpacker(header_->hex_char_array(),
                 reinterpret_cast<const unsigned char *>(cell_data));
             header_->copy_hex_string(unpacker,
@@ -216,7 +283,9 @@ int ObStringDiffDecoder::batch_decode(
         } else if (OB_FAIL(ObRawDecoder::locate_cell_data(cell_data, cell_len, row_data, row_len,
             *ctx.micro_block_header_, *ctx.col_header_, *header_))) {
         } else {
-          if (header_->is_hex_packing()) {
+          if (sparse_plan) {
+            plan.decode(str_ptr, cell_data, hex_chars);
+          } else if (header_->is_hex_packing()) {
             ObHexStringUnpacker unpacker(header_->hex_char_array(),
                 reinterpret_cast<const unsigned char *>(cell_data));
             header_->copy_hex_string(unpacker,

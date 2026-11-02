@@ -32,6 +32,64 @@ namespace oceanbase
 using namespace common;
 namespace sql
 {
+// COUNT(*) observes only the cardinality of this limited view. Its implicit
+// full-text score ordering cannot affect that cardinality. Keep ordinary views,
+// explicit ordering, score predicates and every value-observing aggregate on
+// their original path.
+static bool is_count_only_limited_fulltext_view(
+    const ObIArray<ObParentDMLStmt> &parents, const ObDMLStmt &stmt)
+{
+  if (parents.count() != 1 || nullptr == parents.at(0).stmt_
+      || !parents.at(0).stmt_->is_select_stmt() || !stmt.is_select_stmt()) {
+    return false;
+  }
+  const ObSelectStmt &upper = *static_cast<const ObSelectStmt *>(parents.at(0).stmt_);
+  const ObSelectStmt &child = static_cast<const ObSelectStmt &>(stmt);
+  if (upper.get_table_size() != 1 || upper.get_select_item_size() != 1
+      || upper.get_aggr_item_size() != 1 || upper.is_set_stmt() || !upper.is_scala_group_by()
+      || upper.has_having() || upper.has_distinct() || upper.has_window_function()
+      || upper.has_recursive_cte() || upper.has_subquery() || upper.has_limit()
+      || upper.has_for_update() || upper.is_calc_found_rows() || upper.is_contains_assignment()
+      || upper.get_stmt_hint().get_no_rewrite_hint() != nullptr
+      || child.get_stmt_hint().get_no_rewrite_hint() != nullptr
+      || upper.get_condition_exprs().count() != 0 || upper.get_order_item_size() != 0
+      || child.get_limit_expr() == nullptr || child.is_fetch_with_ties()
+      || child.get_table_size() != 1 || child.get_match_exprs().count() != 1
+      || child.get_condition_exprs().count() != 1 || child.get_order_item_size() != 0
+      || child.is_set_stmt() || child.has_group_by() || child.has_having() || child.has_distinct()
+      || child.get_aggr_item_size() != 0 || child.has_window_function() || child.has_recursive_cte()
+      || child.has_subquery() || child.has_for_update() || child.is_calc_found_rows()
+      || child.is_contains_assignment()) {
+    return false;
+  }
+  const TableItem *view = upper.get_table_item(0);
+  const TableItem *table = child.get_table_item(0);
+  const ObAggFunRawExpr *count = upper.get_aggr_item(0);
+  const ObMatchFunRawExpr *match = child.get_match_exprs().at(0);
+  if (nullptr == view || !view->is_generated_table() || view->ref_query_ != &child
+      || view->is_view_table_ || view->cte_type_ != TableItem::NOT_CTE || !view->exec_params_.empty()
+      || nullptr == table || !table->is_basic_table() || nullptr == count
+      || count->get_expr_type() != T_FUN_COUNT || count->is_param_distinct()
+      || count->get_real_param_count() != 0 || upper.get_select_item(0).expr_ != count
+      || nullptr == match || match->is_es_match() || match->get_mode_flag() != NATURAL_LANGUAGE_MODE
+      || !match->get_columns_boosts().empty() || match->get_param_text_expr() != nullptr) {
+    return false;
+  }
+  const ObRawExpr *predicate = child.get_condition_exprs().at(0);
+  if (predicate != match && (nullptr == predicate || predicate->get_expr_type() != T_OP_BOOL
+      || predicate->get_param_count() != 1 || predicate->get_param_expr(0) != match)) {
+    return false;
+  }
+  for (int64_t i = 0; i < child.get_select_item_size(); ++i) {
+    const ObRawExpr *expr = child.get_select_item(i).expr_;
+    if (nullptr == expr || !expr->is_column_ref_expr()
+        || static_cast<const ObColumnRefRawExpr *>(expr)->is_generated_column()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> &parent_stmts,
                                               ObDMLStmt *&stmt,
                                               bool &trans_happened)
@@ -179,6 +237,7 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
     }
     if (OB_SUCC(ret)) {
       if (stmt->get_match_exprs().count() > 0 &&
+          !is_count_only_limited_fulltext_view(parent_stmts, *stmt) &&
           OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
       } else {
         trans_happened |= is_happened;

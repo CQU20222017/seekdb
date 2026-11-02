@@ -31,7 +31,7 @@ class ObFTParserProperty;
 
 #define FTS_STOP_WORD_MAX_LENGTH 10
 
-static const char ob_stop_word_list[][FTS_STOP_WORD_MAX_LENGTH] = {
+static constexpr char ob_stop_word_list[][FTS_STOP_WORD_MAX_LENGTH] = {
   "a",
   "about",
   "an",
@@ -81,6 +81,8 @@ public:
   int check_stopword(const ObFTWord &word, bool &is_stopword);
 
 private:
+  int lookup_stopword_(const common::ObString &word, bool &is_stopword);
+
   static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;
   // A stop word can only match when its length and first byte are among the ones present in
   // ob_stop_word_list. Rejecting on those two cheap checks keeps the hash lookup off the hot

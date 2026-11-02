@@ -37,7 +37,7 @@ struct ObTextDaaTParam
   ObTextDaaTParam()
     : dim_iters_(nullptr), base_param_(nullptr), allocator_(nullptr), relevance_collector_(nullptr),
       bm25_param_est_ctx_(), mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false), membership_collector_(nullptr), native_dim_iters_(false) {}
   ~ObTextDaaTParam() {}
   TO_STRING_KV(K_(base_param), KP_(dim_iters), K_(bm25_param_est_ctx),  K_(mode_flag), K_(function_lookup_mode));
   ObIArray<ObISRDaaTDimIter *> *dim_iters_;
@@ -47,6 +47,12 @@ struct ObTextDaaTParam
   ObBM25ParamEstCtx bm25_param_est_ctx_;
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
+  // Optional capability supplied by the native text factory. Custom dimension
+  // iterators keep the generic collector path unless they explicitly opt in.
+  ObSRDaaTInnerProductRelevanceCollector *membership_collector_;
+  // True only when the factory guarantees every dim iterator is the native
+  // final token iterator; merges may then use its fused non-virtual advance.
+  bool native_dim_iters_;
 };
 
 class ObTextDaaTIter final : public ObSRDaaTIterImpl
@@ -55,18 +61,22 @@ public:
   ObTextDaaTIter() : ObSRDaaTIterImpl(),
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false), membership_collector_(nullptr), native_dim_iters_(false) {}
   virtual ~ObTextDaaTIter() { reset(); }
 
   int init(const ObTextDaaTParam &param);
   virtual void reuse(const bool switch_tablet = false) override;
   virtual void reset() override;
+  virtual int get_next_rows(const int64_t capacity, int64_t &count) override;
 protected:
   virtual int pre_process() override;
+  virtual int do_one_merge_round(int64_t &count) override;
 protected:
   ObBM25ParamEstimator bm25_param_estimator_;
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
+  ObSRDaaTInnerProductRelevanceCollector *membership_collector_;
+  bool native_dim_iters_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTextDaaTIter);
 };

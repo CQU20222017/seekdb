@@ -44,25 +44,26 @@ namespace oceanbase
 namespace storage
 {
 
-namespace
+/**
+ * @brief Binary comparison of two words, equivalent to
+ *        ObCharset::strcmp(CS_TYPE_UTF8MB4_BIN, left, right).
+ *
+ * The binary collation handler (ob_strnncoll_mb_bin) compares the bytes of
+ * the shorter word and then falls back to the length difference. The range
+ * lookup runs once per character on the tokenizer hot path, so the charset
+ * dispatch is worth avoiding.
+ */
+static inline int ob_ft_bin_word_cmp(const common::ObString &left, const common::ObString &right)
 {
-// utf8mb4_bin collation compares raw bytes, so byte order equals collation order.
-// Using it directly avoids the generic collation dispatch on the tokenize hot path
-// (this helper is called once per character while dictionary matching).
-OB_INLINE int ft_bin_strcmp(const ObString &l, const ObString &r)
-{
-  const int64_t n = l.length() < r.length() ? l.length() : r.length();
-  int cmp = (n > 0) ? MEMCMP(l.ptr(), r.ptr(), n) : 0;
-  if (0 == cmp) {
-    if (l.length() < r.length()) {
-      cmp = -1;
-    } else if (l.length() > r.length()) {
-      cmp = 1;
-    }
+  if (left.empty()) {
+    return right.empty() ? 0 : -1;
+  } else if (right.empty()) {
+    return 1;
   }
-  return cmp;
+  const int64_t len = OB_MIN(left.length(), right.length());
+  const int cmp = memcmp(left.ptr(), right.ptr(), len);
+  return cmp ? cmp : static_cast<int>(left.length() - right.length());
 }
-} // namespace
 
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
@@ -402,7 +403,7 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  if (OB_UNLIKELY(0 == range_dicts_.size())) {
+if (OB_UNLIKELY(0 == range_dicts_.size())) {
     ret = OB_ENTRY_NOT_EXIST;
   } else if (is_sorted_) {
     // Ranges are built in ascending start-word order and never overlap, so the range
@@ -412,14 +413,15 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
     int64_t pos = -1;
     while (lo <= hi) {
       const int64_t mid = lo + ((hi - lo) >> 1);
-      if (ft_bin_strcmp(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+      if (ob_ft_bin_word_cmp(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
         pos = mid;
         lo = mid + 1;
       } else {
         hi = mid - 1;
       }
     }
-    if (pos >= 0 && ft_bin_strcmp(range_dicts_[pos].end_.get_word(), single_word) >= 0) {
+    if (pos >= 0
+        && ob_ft_bin_word_cmp(range_dicts_[pos].end_.get_word(), single_word) >= 0) {
       dict = range_dicts_[pos].dict_;
       found = true;
     }
@@ -468,8 +470,8 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       // Range dictionaries are generated in ascending key order; remember whether that
       // holds so that matching can binary search instead of scanning every range.
       if (0 != range_dicts_.size()
-          && ft_bin_strcmp(range_dicts_[range_dicts_.size() - 1].start_.get_word(),
-                           range.start_.get_word()) >= 0) {
+          && ob_ft_bin_word_cmp(range_dicts_[range_dicts_.size() - 1].start_.get_word(),
+                                range.start_.get_word()) >= 0) {
         is_sorted_ = false;
       }
       if (OB_FAIL(range_dicts_.push_back(range))) {

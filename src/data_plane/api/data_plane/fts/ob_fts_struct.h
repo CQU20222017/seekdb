@@ -51,7 +51,12 @@ private:
   ObObjMeta meta_;
 };
 
-typedef common::hash::ObHashMap<ObFTWord, int64_t> ObFTWordMap;
+// A document's word frequencies are collected synchronously by its parser and
+// consumed by the same caller (TOKENIZE or DAS index-row generation). This map
+// is never shared between requests; shared stopword dictionaries keep their
+// own synchronization.
+typedef common::hash::ObHashMap<ObFTWord, int64_t,
+    common::hash::NoPthreadDefendMode> ObFTWordMap;
 
 class ObAddWordFlag final
 {

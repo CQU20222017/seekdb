@@ -466,6 +466,9 @@ int ObLS::start_local_log_(const int64_t deadline_us, const bool activate_handle
       is_local_append_mode_ = true;
     } else if (OB_FAIL(local_log_handler_set_.activate())) {
       log_handler_.set_local_append_enabled(false);
+    } else if (OB_FAIL(ls_tx_svr_.abort_recovered_local_transactions(deadline_us))) {
+      log_handler_.set_local_append_enabled(false);
+      local_log_handler_set_.deactivate();
     } else {
       is_local_append_mode_ = true;
     }
@@ -493,6 +496,10 @@ int ObLS::activate_local_append_()
   } else if (OB_FAIL(local_log_handler_set_.activate_handler(
       logservice::ObLogBaseType::TRANS_SERVICE_LOG_BASE_TYPE))) {
     LOG_WARN("failed to activate local transaction admission", K(ret));
+  } else if (OB_FAIL(ls_tx_svr_.abort_recovered_local_transactions(
+      ObTimeUtility::current_time() + 60L * 1000L * 1000L))) {
+    local_log_handler_set_.deactivate();
+    log_handler_.set_local_append_enabled(false);
   }
   return ret;
 }

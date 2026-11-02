@@ -450,6 +450,40 @@ void ObLSTxService::deactivate()
   }
 }
 
+int ObLSTxService::abort_recovered_local_transactions(const int64_t deadline_us)
+{
+  int ret = OB_SUCCESS;
+  bool pending = true;
+  if (OB_ISNULL(mgr_)) {
+    ret = OB_NOT_INIT;
+  }
+  while (OB_SUCC(ret) && pending) {
+    pending = false;
+    ObLSTxCtxIterator iter;
+    ObTxCtx *ctx = nullptr;
+    if (OB_FAIL(iter.set_ready(mgr_))) {
+    } else {
+      while (OB_SUCC(ret) && OB_SUCCESS == (ret = iter.get_next_tx_ctx(ctx))) {
+        bool tx_pending = false;
+        ret = ctx->abort_recovered_local_transaction(tx_pending);
+        pending = pending || tx_pending;
+        const int release_ret = iter.revert_tx_ctx(ctx);
+        ctx = nullptr;
+        if (OB_SUCC(ret)) { ret = release_ret; }
+      }
+      if (OB_ITER_END == ret) { ret = OB_SUCCESS; }
+    }
+    if (OB_SUCC(ret) && pending) {
+      if (ObTimeUtility::current_time() >= deadline_us) {
+        ret = OB_TIMEOUT;
+      } else {
+        ob_usleep(1000);
+      }
+    }
+  }
+  return ret;
+}
+
 int ObLSTxService::activate()
 {
   int ret = OB_SUCCESS;

@@ -142,6 +142,24 @@ public:
     }
     return ret;
   }
+  // Fused in-cache advance for merges that hold this final type: step to the
+  // next buffered posting and hand back its id in one non-virtual call. When
+  // the buffer is spent it falls back to the original advance, which reloads
+  // and re-bases the cursor; the cursor must not move before that fallback.
+  OB_INLINE int advance_cached(const ObDatum *&id_datum)
+  {
+    int ret = common::OB_SUCCESS;
+    if (OB_LIKELY(cur_idx_ + 1 < count_)) {
+      ++cur_idx_;
+      id_datum = &doc_id_[cur_idx_].get_datum();
+    } else {
+      ret = get_next_row();
+      if (OB_SUCC(ret)) {
+        id_datum = &doc_id_[cur_idx_].get_datum();
+      }
+    }
+    return ret;
+  }
 private:
   int save_relevances_and_docids();
   int save_docids();

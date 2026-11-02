@@ -74,6 +74,7 @@ public:
   int offline();
   int online();
   void close_replay_tx_ctx_cache();
+  int abort_recovered_local_transactions(const int64_t deadline_us);
 
   // NB: block_normal and unblcok should pair used !!!
   // when you finish block_noraml, you should unblock_normal then push to other state

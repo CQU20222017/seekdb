@@ -238,7 +238,7 @@ int ObDASTextRetrievalMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_c
     int64_t doc_length = 0;
     storage::ObFTParseHelper tokenize_helper;
     common::ObSEArray<ObFTWord, 16> tokens;
-    hash::ObHashMap<ObFTWord, int64_t> token_map;
+    storage::ObFTWordMap token_map;
     const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
     if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
     } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
@@ -249,7 +249,7 @@ int ObDASTextRetrievalMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_c
                            doc_length,
                            token_map))) {
     } else {
-      for (hash::ObHashMap<ObFTWord, int64_t>::const_iterator iter = token_map.begin();
+      for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
           OB_SUCC(ret) && iter != token_map.end();
           ++iter) {
         const ObFTWord &token = iter->first;
@@ -1070,6 +1070,12 @@ int ObDASTRTaatIter::init_stores_by_partition()
     ret = OB_ERR_UNEXPECTED;
   } else {
     int64_t partition_cnt = force_return_docid_ ? 1 : OB_MIN((total_doc_cnt_- 1) / OB_HASHMAP_DEFAULT_SIZE + 1, OB_MAX_HASHMAP_COUNT);
+    // Each partition holds roughly total_doc_cnt_/partition_cnt distinct IDs.
+    // These maps do not grow automatically, so ten buckets would leave long
+    // collision chains for ordinary posting lists. Bound the reservation for
+    // large collections and the single-partition lookup path.
+    const int64_t bucket_count = OB_MAX(10L, OB_MIN(OB_HASHMAP_DEFAULT_SIZE,
+        (total_doc_cnt_ - 1) / partition_cnt + 1));
     hash_map_size_ = partition_cnt;
     void *buf = nullptr;
     if (nullptr == hash_maps_ && OB_SUCC(ret)) {
@@ -1100,7 +1106,7 @@ int ObDASTRTaatIter::init_stores_by_partition()
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
         ObDASTRTaatHashMap *hash_map = new(buf) ObDASTRTaatHashMap();
-        if (OB_FAIL(hash_map->create(10, common::ObMemAttr("FTTaatMap")))) {
+        if (OB_FAIL(hash_map->create(bucket_count, common::ObMemAttr("FTTaatMap")))) {
         } else {
           hash_maps_[i] = hash_map;
         }
@@ -1200,6 +1206,7 @@ int ObDASTRTaatIter::fill_chunk_store_by_tr_iter()
             for (int64_t i = 0; i < hash_map_size_; ++i) {
               skips[i]->set_all(capacity);
             }
+            uint64_t populated_partitions = 0;
             for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
               ObExpr *doc_id_expr = ir_ctdef_->inv_scan_domain_id_col_;
               const ObDatum &doc_id_datum = doc_id_expr->locate_expr_datum(*ir_rtdef_->get_inv_idx_scan_rtdef()->eval_ctx_, i);
@@ -1208,11 +1215,16 @@ int ObDASTRTaatIter::fill_chunk_store_by_tr_iter()
               } else {
                 uint64_t partition = murmurhash(doc_id_datum.ptr_, doc_id_datum.len_, 0) % hash_map_size_;
                 skips[partition]->unset(i);
+                populated_partitions |= uint64_t{1} << partition;
               }
             }
             int64_t check_count = 0;
             // fill the datum_stores_
             for (int64_t i = 0; OB_SUCC(ret) && i < hash_map_size_; ++i) {
+              // Small vector batches usually leave many partitions empty.
+              // Preserve the partition order without calling the row-store
+              // serializer for an all-skipped batch.
+              if (0 == (populated_partitions & (uint64_t{1} << i))) { continue; }
               int64_t stored_rows_count = 0;
               if (OB_FAIL(datum_stores_[i]->add_batch(exprs,
                                                  *(ir_rtdef_->get_inv_idx_scan_rtdef()->eval_ctx_),
@@ -1346,7 +1358,6 @@ int ObDASTRTaatIter::inner_load_next_hashmap()
 
   ObDocIdExt doc_id;
   double cur_relevance = 0;
-  double last_relevance = 0;
   while (OB_SUCC(ret)) {
     if (OB_FAIL(store_iter->get_next_row(*ctx, exprs))) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
@@ -1357,12 +1368,13 @@ int ObDASTRTaatIter::inner_load_next_hashmap()
       } else if (need_relevance) {
         ObDatum &relevance_datum = relevance_expr->locate_expr_datum(*ir_rtdef_->eval_ctx_);
         cur_relevance = relevance_datum.get_double();
-        if (OB_FAIL(map->get_refactored(doc_id, last_relevance))) {
-          if (OB_HASH_NOT_EXIST != ret) {
-          } else if (OB_FAIL(map->set_refactored(doc_id, cur_relevance, 1/*overwrite*/))) {
-          }
-        } else if (OB_FAIL(map->set_refactored(doc_id, cur_relevance + last_relevance, 1/*overwrite*/))) {
-        }
+        struct AddRelevance {
+          explicit AddRelevance(double score) : score_(score) {}
+          void operator()(hash::HashMapPair<ObDocIdExt, double> &entry) const
+          { entry.second = score_ + entry.second; }
+          double score_;
+        } add_relevance(cur_relevance);
+        ret = map->set_or_update(doc_id, cur_relevance, add_relevance);
       } else {
         if (OB_FAIL(map->set_refactored(doc_id, 1, 0/*overwrite*/))) {
         }

@@ -353,11 +353,39 @@ int ObAiColumnWorker::process_group(const common::ObIArray<WorkItem> &items,
                                         first.rowkey_predicate_.length(),
                                         first.rowkey_predicate_.ptr()))) {
         publish_ret = ret;
-      } else if (OB_FAIL(conn->execute_write(sql.ptr(), published))) {
+      } else if (OB_FAIL(conn->start_transaction())) {
+        // The value write and the removal of the work item must be one transaction.
+        // Two transactions would leave a window in which the row is already READY
+        // while the work item of that very request is still pending; a concurrent
+        // `ai_column_strict_read` query rejects the table inside that window.
         publish_ret = ret;
-        LOG_WARN("fail to publish the ai column value", K(ret), K(sql));
+        LOG_WARN("fail to start the publish transaction", K(ret));
+      } else {
+        int64_t deleted = 0;
+        if (OB_FAIL(conn->execute_write(sql.ptr(), published))) {
+          publish_ret = ret;
+          LOG_WARN("fail to publish the ai column value", K(ret), K(sql));
+        } else if (OB_FAIL(sql.assign_fmt(
+                     "delete from oceanbase.__all_ai_column_task where table_id = %lu "
+                     "and rowkey_predicate = '%.*s' and request_id = '%.*s'",
+                     first.table_id_,
+                     first.rowkey_predicate_.length(), first.rowkey_predicate_.ptr(),
+                     first.request_id_.length(), first.request_id_.ptr()))) {
+          publish_ret = ret;
+          LOG_WARN("fail to build the finish sql", K(ret));
+        } else if (OB_FAIL(conn->execute_write(sql.ptr(), deleted))) {
+          publish_ret = ret;
+          LOG_WARN("fail to drop the finished ai column work items", K(ret), K(sql));
+        }
+        const int tmp_ret = OB_SUCCESS == publish_ret ? conn->commit() : conn->rollback();
+        if (OB_SUCCESS != tmp_ret) {
+          LOG_WARN("fail to finish the publish transaction", K(tmp_ret), K(publish_ret));
+          if (OB_SUCCESS == publish_ret) {
+            publish_ret = tmp_ret;
+          }
+        }
+        ret = OB_SUCCESS;
       }
-      ret = OB_SUCCESS;
       if (OB_SUCCESS != publish_ret) {
         // 3a. the publish failed: hand the work item back with a small backoff, or give up
         const int64_t next_retry = first.retry_count_ + 1;
@@ -422,19 +450,9 @@ int ObAiColumnWorker::process_group(const common::ObIArray<WorkItem> &items,
                     K(first.request_id_));
         }
       } else {
-        // 3b. the row may have been deleted concurrently (published == 0): not an error, the
-        // work item is dropped as well
+        // 3b. the work item was dropped in the publish transaction above; a row that was
+        // deleted concurrently (published == 0) simply publishes nothing
         LOG_TRACE("ai column work item published", K(published), K(group_size));
-        if (OB_FAIL(sql.assign_fmt(
-                "delete from oceanbase.__all_ai_column_task where table_id = %lu "
-                "and rowkey_predicate = '%.*s' and request_id = '%.*s'",
-                first.table_id_,
-                first.rowkey_predicate_.length(), first.rowkey_predicate_.ptr(),
-                first.request_id_.length(), first.request_id_.ptr()))) {
-          LOG_WARN("fail to build the finish sql", KR(ret));
-        } else if (OB_FAIL(conn->execute_write(sql.ptr(), affected_rows))) {
-          LOG_WARN("fail to drop the finished ai column work items", KR(ret), K(sql));
-        }
       }
     }
   }

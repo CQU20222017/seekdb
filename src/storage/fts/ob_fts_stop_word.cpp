@@ -22,11 +22,56 @@
 #include "storage/fts/ob_fts_stop_word.h"
 #include "storage/fts/ob_fts_parser_helper.h"
 #include "storage/fts/ob_fts_parser_property.h"
+#include <algorithm>
+#include <array>
+#include <string_view>
 
 namespace oceanbase
 {
 namespace storage
 {
+
+namespace {
+// Derive the ASCII index from the authoritative vocabulary. It is immutable
+// and initialized at compile time, so readers need neither a lock nor an arena.
+constexpr auto FTS_ASCII_STOPWORDS = [] {
+  std::array<std::string_view, sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0])> words{};
+  for (size_t i = 0; i < words.size(); ++i) {
+    words[i] = std::string_view(ob_stop_word_list[i]);
+  }
+  std::sort(words.begin(), words.end());
+  return words;
+}();
+static_assert([] {
+  for (const auto word : FTS_ASCII_STOPWORDS) {
+    for (const char c : word) {
+      if (c < 'a' || c > 'z') { return false; }
+    }
+  }
+  return true;
+}(), "The ASCII stopword index requires lowercase ASCII vocabulary");
+
+bool lookup_ascii_stopword(const ObString &word, bool &is_stopword)
+{
+  int64_t length = word.length();
+  // The dictionary's varchar collation ignores trailing U+0020 spaces.
+  while (length > 0 && word.ptr()[length - 1] == ' ') { --length; }
+  char folded[FTS_STOP_WORD_MAX_LENGTH];
+  for (int64_t i = 0; i < length; ++i) {
+    unsigned char c = static_cast<unsigned char>(word.ptr()[i]);
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+      return false; // Unicode and other characters retain collation-aware lookup.
+    }
+    if (i < static_cast<int64_t>(sizeof(folded))) {
+      folded[i] = c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+    }
+  }
+  is_stopword = length < static_cast<int64_t>(sizeof(folded))
+      && std::binary_search(FTS_ASCII_STOPWORDS.begin(), FTS_ASCII_STOPWORDS.end(),
+                            std::string_view(folded, length));
+  return true;
+}
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////
 // class ObStopWordChecker
@@ -85,12 +130,18 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (ObCharset::charset_type_by_coll(word.get_collation_type()) == CHARSET_UTF8MB4) {
+    // Every UTF-8 collation has the same byte encoding. As with charset_convert,
+    // conversion to the dictionary collation only changes comparison semantics.
+    if (!lookup_ascii_stopword(word.get_word().get_string(), is_stopword)) {
+      ret = lookup_stopword_(word.get_word().get_string(), is_stopword);
+    }
   } else {
+    common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
     common::ObString cmp_str;
     const bool same_collation = (word.get_collation_type() == stopword_type_.get_collation_type());
     if (same_collation) {
@@ -116,19 +167,21 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
       // No stop word has this length or this first byte, so the hash lookup cannot match.
       is_stopword = false;
     } else {
-      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
-      ret = stopword_set_.exist_refactored(converted);
-      if (OB_HASH_NOT_EXIST == ret) {
-        is_stopword = false;
-        ret = OB_SUCCESS;
-      } else if (OB_HASH_EXIST == ret) {
-        is_stopword = true;
-        ret = OB_SUCCESS;
-      } else if (OB_SUCC(ret)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else {
-      }
+      ret = lookup_stopword_(cmp_str, is_stopword);
     }
+  }
+  return ret;
+}
+
+int ObStopWordChecker::lookup_stopword_(const ObString &word, bool &is_stopword)
+{
+  ObFTWord converted(word.length(), word.ptr(), stopword_type_);
+  int ret = stopword_set_.exist_refactored(converted);
+  if (OB_HASH_NOT_EXIST == ret || OB_HASH_EXIST == ret) {
+    is_stopword = OB_HASH_EXIST == ret;
+    ret = OB_SUCCESS;
+  } else if (OB_SUCC(ret)) {
+    ret = OB_ERR_UNEXPECTED;
   }
   return ret;
 }
@@ -233,13 +286,15 @@ int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
   } else {
-    // One hash probe for the frequent "word already seen" case; only a new word needs the
-    // insert. (The original did get_refactored + set_refactored, i.e. two probes, always.)
-    int64_t *word_count = word_map_.get(word);
-    if (OB_NOT_NULL(word_count)) {
-      *word_count += word_freq;
-    } else if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
-    }
+struct AddFrequency {
+      explicit AddFrequency(int64_t frequency) : frequency_(frequency) {}
+      void operator()(hash::HashMapPair<ObFTWord, int64_t> &entry) const
+      { entry.second += frequency_; }
+      int64_t frequency_;
+    } add_frequency(word_freq);
+    // Preserve the initial count and accumulate repeats under one bucket lock.
+    // Updating in place also avoids allocating a replacement hash node.
+    ret = word_map_.set_or_update(word, 1 /* initial word count */, add_frequency);
   }
   return ret;
 }

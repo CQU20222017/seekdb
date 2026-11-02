@@ -295,8 +295,15 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     } else {
       ObString norm_alnum_token(norm_token_len, norm_token_ptr);
       ObString norm_lower_token;
-      if (!token_needs_case_fold(norm_token_ptr, norm_token_len)) {
-        // pure ASCII lower case token: tolower() would copy it unchanged, skip the copy
+bool already_lower_ascii = cs_->number == CS_TYPE_UTF8MB4_GENERAL_CI
+                              || cs_->number == CS_TYPE_UTF8MB4_BIN;
+      for (uint32_t i = 0; already_lower_ascii && i < norm_token_len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(norm_token_ptr[i]);
+        already_lower_ascii = c < 0x80 && !(c >= 'A' && c <= 'Z');
+      }
+      if (already_lower_ascii) {
+        // Like the normalizer's arena, the input token remains valid until
+        // the next get_next(). Consumers retaining tokens still copy them.
         next_token.set_string(norm_alnum_token);
       } else if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
       } else {

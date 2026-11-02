@@ -48,6 +48,8 @@ public:
       const common::ObString &parser_properties);
   int segment(const common::ObObjMeta &ft_obj_meta, const ObDatum &doc_id, const common::ObString &fulltext);
   int get_next_row(blocksstable::ObDatumRow *&row);
+  // Borrow a batch from the current document. Valid until segment/reuse/reset.
+  int get_next_rows(const int64_t capacity, blocksstable::ObDatumRow *const *&rows, int64_t &count);
   void reset();
   void reuse();
   TO_STRING_KV(K_(row_idx), K_(is_fts_index_aux), K_(helper), K_(is_inited),
