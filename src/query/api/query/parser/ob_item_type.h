@@ -2280,9 +2280,12 @@ typedef enum ObItemType
   T_DIFF_TABLE = 4918,
   T_MERGE_TABLE = 4919,
   T_FLUSH_PRIVILEGES = 4920,
-  // One ALTER TABLE <t> RETRY AI COLUMN <col> [WHERE <pred>] action: children are [0] the
+// One ALTER TABLE <t> RETRY AI COLUMN <col> [WHERE <pred>] action: children are [0] the
   // column name, [1] the optional WHERE predicate.
   T_AI_COLUMN_RETRY = 4921,
+  T_FILE_TABLE_EXPRESSION = 4922,
+  T_COPY = 4923,
+  T_DESCRIBE = 4924,
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 
