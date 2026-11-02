@@ -18,6 +18,7 @@
 #define USING_LOG_PREFIX STORAGE_FTS
 
 #include "share/rc/ob_server_runtime.h"
+#include "share/text_analysis/ob_token_stream.h"
 #include "storage/fts/ob_fts_stop_word.h"
 #include "storage/fts/ob_fts_parser_helper.h"
 #include "storage/fts/ob_fts_parser_property.h"
@@ -49,9 +50,19 @@ int ObStopWordChecker::init()
     stop_meta.set_collation_type(ObCollationType::CS_TYPE_UTF8MB4_GENERAL_CI);
 
     stopword_type_.set_meta(stop_meta);
+    MEMSET(first_byte_mask_, 0, sizeof(first_byte_mask_));
+    max_stopword_len_ = 0;
     const int64_t stopword_count = sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]);
     for (int64_t i = 0; OB_SUCC(ret) && i < stopword_count; ++i) {
-      ObFTWord stopword(STRLEN(ob_stop_word_list[i]), ob_stop_word_list[i], stopword_type_);
+      const int64_t word_len = STRLEN(ob_stop_word_list[i]);
+      if (word_len > max_stopword_len_) {
+        max_stopword_len_ = word_len;
+      }
+      if (word_len > 0) {
+        const unsigned char first_byte = static_cast<unsigned char>(ob_stop_word_list[i][0]);
+        first_byte_mask_[first_byte >> 3] |= static_cast<uint8_t>(1 << (first_byte & 0x7));
+      }
+      ObFTWord stopword(word_len, ob_stop_word_list[i], stopword_type_);
       if (OB_FAIL(stopword_set_.set_refactored(stopword))) {
       }
     }
@@ -81,7 +92,8 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
     ret = OB_INVALID_ARGUMENT;
   } else {
     common::ObString cmp_str;
-    if (word.get_collation_type() == stopword_type_.get_collation_type()) {
+    const bool same_collation = (word.get_collation_type() == stopword_type_.get_collation_type());
+    if (same_collation) {
       // Same charset: charset_convert only copies the input, so skip it entirely.
       cmp_str = word.get_word().get_string();
     } else {
@@ -97,7 +109,13 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
                                        cmp_str))) {
       }
     }
-    if (OB_SUCC(ret)) {
+    if (OB_FAIL(ret)) {
+    } else if (same_collation
+               && (cmp_str.length() > max_stopword_len_ || cmp_str.empty()
+                   || !is_first_byte_of_stopword(static_cast<unsigned char>(cmp_str.ptr()[0])))) {
+      // No stop word has this length or this first byte, so the hash lookup cannot match.
+      is_stopword = false;
+    } else {
       ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
       ret = stopword_set_.exist_refactored(converted);
       if (OB_HASH_NOT_EXIST == ret) {
@@ -168,21 +186,25 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
+  const common::ObString src_str = src.get_word().get_string();
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (flag_.casedown()) {
+  } else if (!flag_.casedown()
+             || !share::token_needs_case_fold(src_str.ptr(), src_str.length())) {
+    // Nothing to fold (pure ASCII lower case, or folding disabled): tolower() would only
+    // copy the token into a fresh buffer, so keep pointing at the existing bytes.
+    dst = src;
+  } else {
     ObString dst_str;
     if (OB_FAIL(ObCharset::tolower(
                     word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
+                    src_str,
                     dst_str,
                     allocator_))) {
     } else {
       ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
       dst = tmp;
     }
-  } else {
-    dst = src;
   }
   return ret;
 }
@@ -205,20 +227,18 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    // One hash probe for the frequent "word already seen" case; only a new word needs the
+    // insert. (The original did get_refactored + set_refactored, i.e. two probes, always.)
+    int64_t *word_count = word_map_.get(word);
+    if (OB_NOT_NULL(word_count)) {
+      *word_count += word_freq;
+    } else if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
   }
   return ret;

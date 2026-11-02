@@ -120,6 +120,25 @@ private:
   // int check_stop_words(const ObDatum &check_token, bool &is_valid);
 };
 
+// True when lower-casing the token cannot change it: every byte is ASCII and none of them is
+// an upper case letter. Multi-byte (non ASCII) tokens may carry cased characters, so they are
+// reported as "needs folding" and go through the general conversion path.
+inline bool token_needs_case_fold(const char *ptr, const int64_t len)
+{
+  bool needs_fold = false;
+  if (OB_ISNULL(ptr) || len <= 0) {
+    needs_fold = false;
+  } else {
+    for (int64_t i = 0; !needs_fold && i < len; ++i) {
+      const unsigned char c = static_cast<unsigned char>(ptr[i]);
+      if (c >= 0x80 || (c >= 'A' && c <= 'Z')) {
+        needs_fold = true;
+      }
+    }
+  }
+  return needs_fold;
+}
+
 // remove leading / trailing punctuations and to_lower case alphabetic characters
 class ObBasicEnglishNormalizer final : public ObTokenNormalizer
 {

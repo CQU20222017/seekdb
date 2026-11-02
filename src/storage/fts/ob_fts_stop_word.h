@@ -82,10 +82,21 @@ public:
 
 private:
   static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;
+  // A stop word can only match when its length and first byte are among the ones present in
+  // ob_stop_word_list. Rejecting on those two cheap checks keeps the hash lookup off the hot
+  // path for the overwhelming majority of tokens (exact: no false negatives).
+  static const int64_t FIRST_BYTE_MASK_BYTES = 256 / 8;
   typedef common::hash::ObHashSet<storage::ObFTWord> StopWordSet;
+
+  OB_INLINE bool is_first_byte_of_stopword(const unsigned char first_byte) const
+  {
+    return 0 != (first_byte_mask_[first_byte >> 3] & (1 << (first_byte & 0x7)));
+  }
 
   StopWordSet stopword_set_;
   ObObjMeta stopword_type_;
+  int64_t max_stopword_len_ = 0;
+  uint8_t first_byte_mask_[FIRST_BYTE_MASK_BYTES] = {0};
 
   bool inited_ = false;
 
