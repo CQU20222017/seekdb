@@ -1,0 +1,18 @@
+{
+  "rows": 50000,
+  "dim": 128,
+  "m": 16,
+  "ef_construction": 100,
+  "metric": "l2",
+  "backend": "cpu-scalar",
+  "gpu": 0,
+  "build_seconds": 23.683722,
+  "distance_evaluations": 213346849,
+  "backend_calls": 12875293,
+  "pairs_per_second": 8993277.5,
+  "max_level": 4,
+  "recall_at_k": 0.608500,
+  "k": 10,
+  "ef_search": 64,
+  "queries": 200
+}
