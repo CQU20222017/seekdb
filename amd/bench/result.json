@@ -1,0 +1,89 @@
+{
+  "config": {
+    "n": 800,
+    "d": 64,
+    "queries": 50,
+    "k": 10,
+    "ef": 64,
+    "cand_k": 33,
+    "max_degree": 16,
+    "runs": 3,
+    "seed": 42,
+    "numpy": false
+  },
+  "gen_seconds": 0.02002413599999997,
+  "cpu_runs": [
+    {
+      "candidates_s": 1.2836611260000002,
+      "assemble_s": 0.006856576000000114,
+      "total_s": 1.2905177020000003
+    },
+    {
+      "candidates_s": 1.2311103479999996,
+      "assemble_s": 0.006451321000000121,
+      "total_s": 1.2375616689999998
+    },
+    {
+      "candidates_s": 1.2188811819999996,
+      "assemble_s": 0.006101675000000029,
+      "total_s": 1.2249828569999996
+    }
+  ],
+  "cpu_stats": {
+    "candidates": {
+      "runs": 3,
+      "median": 1.2311103479999996,
+      "mean": 1.2445508853333331,
+      "min": 1.2188811819999996,
+      "max": 1.2836611260000002,
+      "stdev": 0.02810215079571135
+    },
+    "assemble": {
+      "runs": 3,
+      "median": 0.006451321000000121,
+      "mean": 0.0064698573333334215,
+      "min": 0.006101675000000029,
+      "max": 0.006856576000000114,
+      "stdev": 0.00030846564010746774
+    },
+    "total": {
+      "runs": 3,
+      "median": 1.2375616689999998,
+      "mean": 1.2510207426666666,
+      "min": 1.2249828569999996,
+      "max": 1.2905177020000003,
+      "stdev": 0.02839676008828119
+    }
+  },
+  "graph": {
+    "nodes": 800,
+    "avg_degree": 16.0,
+    "isolated_nodes": 0,
+    "reachable_ratio": 1.0
+  },
+  "recall": {
+    "k": 10,
+    "value": 0.974,
+    "query_seconds": 0.19569601999999975
+  },
+  "gpu_model": {
+    "gpu_distance_s": 0.15388879349999995,
+    "assemble_s": 0.006451321000000121,
+    "transfer_s": 3.104e-05,
+    "launch_overhead_s": 0.005,
+    "gpu_total_s": 0.1653711545000001,
+    "distance_speedup_assumed": 8.0,
+    "bandwidth_gb_s_assumed": 10.0
+  },
+  "gpu_path": {
+    "status": "CPU_ONLY",
+    "countable": false,
+    "reason": "no AMD GPU / hipVS in this environment",
+    "model_speedup": 7.483540117632783
+  },
+  "conclusion": {
+    "cpu_median_ms": 1237.5616689999997,
+    "gpu_model_ms": 165.3711545000001,
+    "model_speedup": 7.483540117632783
+  }
+}
