@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Copyright (c) 2025 OceanBase
  * hipVS accelerated HNSW build for seekdb - hipVS backend (HIP)
  *
@@ -92,7 +92,7 @@ public:
       return -1;
     }
     const size_t bytes = static_cast<size_t>(rows) * static_cast<size_t>(dim) * sizeof(float);
-    if (hipMalloc(&d_base_, bytes) != hipSuccess) {
+    if (hipMalloc(reinterpret_cast<void **>(&d_base_), bytes) != hipSuccess) {
       return -1;
     }
     if (hipMemcpy(d_base_, base, bytes, hipMemcpyHostToDevice) != hipSuccess) {
@@ -128,8 +128,8 @@ public:
     float *d_query = nullptr;
     uint32_t *d_ids = nullptr;
     float *d_out = nullptr;
-    if (hipMalloc(&d_query, qbytes) != hipSuccess || hipMalloc(&d_ids, ibytes) != hipSuccess ||
-        hipMalloc(&d_out, obytes) != hipSuccess) {
+    if (hipMalloc(reinterpret_cast<void **>(&d_query), qbytes) != hipSuccess || hipMalloc(reinterpret_cast<void **>(&d_ids), ibytes) != hipSuccess ||
+        hipMalloc(reinterpret_cast<void **>(&d_out), obytes) != hipSuccess) {
       ret = -1;
     } else if (hipMemcpy(d_query, query, qbytes, hipMemcpyHostToDevice) != hipSuccess ||
                hipMemcpy(d_ids, ids, ibytes, hipMemcpyHostToDevice) != hipSuccess) {
