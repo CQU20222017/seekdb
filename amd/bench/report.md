@@ -4,22 +4,22 @@ CPU phases are measured; the GPU column comes from an explicit cost model, not f
 
 - data: n=800 d=64 queries=50 seed=42 numpy=no
 - parameters: cand_k=33 max_degree=16 k=10 ef=64
-- data generation: 16.0 ms (excluded from build time)
+- data generation: 16.6 ms (excluded from build time)
 
 ## CPU build (measured, median of 3 runs)
 
 | phase | median ms | min ms | max ms | stdev ms |
 | --- | ---: | ---: | ---: | ---: |
-| candidate search (distance) | 1188.8 | 1183.0 | 1192.4 | 3.87 |
-| graph assembly (CPU)        | 5.8 | 5.8 | 6.3 | 0.25 |
-| **total**                   | **1194.6** | 1188.8 | 1198.7 | 4.06 |
+| candidate search (distance) | 1192.8 | 1191.2 | 1243.0 | 24.08 |
+| graph assembly (CPU)        | 6.3 | 6.0 | 6.5 | 0.21 |
+| **total**                   | **1199.3** | 1197.5 | 1249.0 | 23.88 |
 
 ## GPU path (cost model, assumptions stated)
 
-- distance on hipVS: 1188.8 / 8.0 = 148.6 ms
-- assembly (stays on CPU): 5.8 ms
+- distance on hipVS: 1192.8 / 8.0 = 149.1 ms
+- assembly (stays on CPU): 6.3 ms
 - PCIe transfer @ 10 GB/s: 0.03 ms; launch overhead: 5.0 ms
-- **model total: 159.5 ms  ->  model speedup 7.49x**
+- **model total: 160.5 ms  ->  model speedup 7.47x**
 
 ## Quality gate
 
