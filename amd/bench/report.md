@@ -2,29 +2,29 @@
 
 CPU phases are measured; the GPU column comes from an explicit cost model, not from a GPU (no AMD GPU in this environment).
 
-- data: n=800 d=64 queries=50 seed=42 numpy=no
+- data: n=300 d=32 queries=20 seed=42 numpy=no
 - parameters: cand_k=33 max_degree=16 k=10 ef=64
-- data generation: 20.0 ms (excluded from build time)
+- data generation: 3.5 ms (excluded from build time)
 
 ## CPU build (measured, median of 3 runs)
 
 | phase | median ms | min ms | max ms | stdev ms |
 | --- | ---: | ---: | ---: | ---: |
-| candidate search (distance) | 1231.1 | 1218.9 | 1283.7 | 28.10 |
-| graph assembly (CPU)        | 6.5 | 6.1 | 6.9 | 0.31 |
-| **total**                   | **1237.6** | 1225.0 | 1290.5 | 28.40 |
+| candidate search (distance) | 97.8 | 96.6 | 100.1 | 1.45 |
+| graph assembly (CPU)        | 1.8 | 1.7 | 1.8 | 0.04 |
+| **total**                   | **99.6** | 98.3 | 101.9 | 1.49 |
 
 ## GPU path (cost model, assumptions stated)
 
-- distance on hipVS: 1231.1 / 8.0 = 153.9 ms
-- assembly (stays on CPU): 6.5 ms
-- PCIe transfer @ 10 GB/s: 0.03 ms; launch overhead: 5.0 ms
-- **model total: 165.4 ms  ->  model speedup 7.48x**
+- distance on hipVS: 97.8 / 8.0 = 12.2 ms
+- assembly (stays on CPU): 1.8 ms
+- PCIe transfer @ 10 GB/s: 0.01 ms; launch overhead: 5.0 ms
+- **model total: 19.0 ms  ->  model speedup 5.24x**
 
 ## Quality gate
 
-- recall@10: **0.9740** (best-first search vs exact ground truth)
-- graph: 800 nodes, avg degree 16.0, isolated 0, reachable 1.000
+- recall@10: **1.0000** (best-first search vs exact ground truth)
+- graph: 300 nodes, avg degree 16.0, isolated 0, reachable 1.000
 
 ## Path status
 
